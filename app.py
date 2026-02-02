@@ -19,15 +19,10 @@ st.set_page_config(page_title="🎬 나와 어울리는 영화는?", page_icon="
 st.markdown(
     """
 <style>
-/* 전체 폭과 여백 */
 .block-container {max-width: 1100px; padding-top: 1.2rem; padding-bottom: 3rem;}
-/* 제목 아래 간격 */
 h1 {margin-bottom: 0.2rem;}
-/* 라디오 간격 */
 div[role="radiogroup"] {gap: 0.25rem;}
-/* 구분선 여백 */
 hr {margin: 1.0rem 0 1.0rem 0;}
-/* 뱃지 */
 .badge{
   display:inline-block; padding:6px 10px; border-radius:999px;
   background: #f1f5f9; border:1px solid #e2e8f0; font-weight:700; font-size:12px;
@@ -36,7 +31,6 @@ hr {margin: 1.0rem 0 1.0rem 0;}
 .badge-strong{ background:#ecfeff; border-color:#a5f3fc; }
 .badge-warn{ background:#fff7ed; border-color:#fed7aa; }
 .small-muted{ color:#64748b; font-size: 0.92rem; }
-.card-title{ font-size:1.05rem; font-weight:800; margin:0 0 0.35rem 0; }
 </style>
 """,
     unsafe_allow_html=True,
@@ -169,18 +163,18 @@ def poster_base_url(api_key: str, preferred_size="w500") -> str:
 # =========================
 # TMDB: discover/movie + movie detail (ko 비면 en 보조)
 # =========================
-@st.cache_data(ttl=60 * 20, show_spinner=False)
+@st.cache_data(ttl=60 * 15, show_spinner=False)
 def discover_requests(api_key: str, params: dict) -> list:
     session = get_http_session()
     url = "https://api.themoviedb.org/3/discover/movie"
-    base_params = {"api_key": api_key, "include_adult": "false", "page": 1}
+    base_params = {"api_key": api_key, "include_adult": "false"}
     base_params.update(params)
     r = session.get(url, params=base_params, timeout=15)
     r.raise_for_status()
     return (r.json() or {}).get("results", []) or []
 
 
-@st.cache_data(ttl=60 * 20, show_spinner=False)
+@st.cache_data(ttl=60 * 15, show_spinner=False)
 def discover_tmdbsimple(api_key: str, params: dict) -> list:
     tmdb.API_KEY = api_key
     d = tmdb.Discover()
@@ -216,7 +210,7 @@ def movie_details(api_key: str, movie_id: int, language: str) -> dict:
     return movie_details_requests(api_key, movie_id, language)
 
 
-def pick_best_overview(api_key: str, movie: dict, prefer_lang: str = "ko-KR") -> str:
+def pick_best_overview(api_key: str, movie: dict) -> str:
     overview = (movie.get("overview") or "").strip()
     if overview:
         return overview
@@ -224,7 +218,6 @@ def pick_best_overview(api_key: str, movie: dict, prefer_lang: str = "ko-KR") ->
     if not mid:
         return ""
     try:
-        # ko가 비면 en-US 보조
         detail_en = movie_details(api_key, int(mid), "en-US")
         return (detail_en.get("overview") or "").strip()
     except Exception:
@@ -249,15 +242,10 @@ def analyze_answers(answers: dict) -> dict:
     def pri(g: str) -> int:
         return PRIORITY.index(g) if g in PRIORITY else 999
 
-    sorted_items = sorted(
-        scores.items(),
-        key=lambda kv: (kv[1], -pri(kv[0])),
-        reverse=True,
-    )
+    sorted_items = sorted(scores.items(), key=lambda kv: (kv[1], -pri(kv[0])), reverse=True)
     top1, s1 = sorted_items[0]
     top2, s2 = sorted_items[1]
 
-    # 혼합 비율: 점수 차이가 작을수록 더 섞기
     if s2 <= 0:
         mix = [(top1, 1.0)]
     else:
@@ -271,11 +259,10 @@ def analyze_answers(answers: dict) -> dict:
         else:
             mix = [(top1, 0.8), (top2, 0.2)]
 
-    return {"scores": scores, "mix": mix, "top1": top1, "top2": top2}
+    return {"scores": scores, "mix": mix}
 
 
 def with_genres_from_mix(mix: list[tuple[str, float]]) -> str:
-    # OR 검색: "10749|18"
     ids = [str(GENRES[g]) for g, w in mix if w > 0]
     return "|".join(ids)
 
@@ -287,7 +274,6 @@ def clamp(text: str, n: int = 260) -> str:
 
 
 def build_reason(mix: list[tuple[str, float]], scores: dict, movie: dict) -> str:
-    # 대학생 마이크로카피 + 대중픽/호평작 느낌
     parts = [f"{g} {int(round(w*100))}%" for g, w in mix if w > 0]
     mix_str = " + ".join(parts) if parts else "취향 믹스"
 
@@ -343,7 +329,7 @@ def reset_test():
 
 
 # =========================
-# Sidebar: 설정만 깔끔하게
+# Sidebar: 설정
 # =========================
 with st.sidebar:
     st.header("🔑 TMDB 설정")
@@ -369,13 +355,6 @@ with st.sidebar:
         if show_year_filter:
             year_val = st.number_input("개봉 연도", min_value=1960, max_value=2030, value=2020, step=1)
 
-    if "language" not in locals():
-        # expander 안 열었을 때 대비 기본값
-        language = "ko-KR"
-        region_val = "KR"
-        vote_count_min = 500
-        year_val = None
-
     st.divider()
     if TMDBSIMPLE_AVAILABLE:
         st.success("tmdbsimple 사용 중")
@@ -386,52 +365,18 @@ with st.sidebar:
 
 
 # =========================
-# 메인 상단: 인트로 + CTA
+# 메인 인트로
 # =========================
 st.markdown("## 🎬 나와 어울리는 영화는?")
 st.markdown(
     '<div class="small-muted">5문항 · 1분 컷! 지금 기분에 딱 맞는 영화 5개를 추천해줄게요 🍿</div>',
     unsafe_allow_html=True,
 )
-
-st.write("")
-cta1, cta2 = st.columns([2, 1])
-with cta1:
-    st.markdown(
-        """
-- **결과 보기**를 누르면 답변을 분석해 장르를 섞어서 추천해요  
-- 추천은 **대중픽(인기순)** / **호평작(평점순)** 두 가지로 보여줘요
-"""
-    )
-with cta2:
-    st.markdown(
-        """
-<div class="badge badge-warn">TIP</div>
-<div class="small-muted">API Key는 사이드바에 입력!</div>
-""",
-        unsafe_allow_html=True,
-    )
-
 st.divider()
 
-
 # =========================
-# 질문 화면: 카드/컨테이너 느낌으로 정리 (단계형 X)
+# 질문 화면(2열)
 # =========================
-def begin_card(title: str, subtitle: str | None = None):
-    try:
-        c = st.container(border=True)
-    except TypeError:
-        c = st.container()
-    with c:
-        st.markdown(f'<div class="card-title">{title}</div>', unsafe_allow_html=True)
-        if subtitle:
-            st.markdown(f'<div class="small-muted">{subtitle}</div>', unsafe_allow_html=True)
-        st.write("")
-    return c
-
-
-# 질문을 2열로 배치(시각적으로 덜 길어 보이게)
 left, right = st.columns(2, gap="large")
 
 for idx, q in enumerate(questions, start=1):
@@ -440,7 +385,6 @@ for idx, q in enumerate(questions, start=1):
         st.session_state.answers[key] = q["options"][0]
 
     target_col = left if idx in (1, 3, 5) else right
-
     with target_col:
         try:
             box = st.container(border=True)
@@ -458,10 +402,6 @@ for idx, q in enumerate(questions, start=1):
 
 st.divider()
 
-
-# =========================
-# 하단: 버튼 영역 (고정된 느낌)
-# =========================
 b1, b2, b3 = st.columns([1.2, 1.2, 2.6])
 with b1:
     submit = st.button("결과 보기", type="primary", use_container_width=True)
@@ -472,9 +412,60 @@ with b3:
 
 
 # =========================
+# 핵심 수정: vote_count 필터가 "확실히" 적용되도록
+# - 여러 페이지에서 후보를 더 가져온 뒤
+# - 클라이언트에서 vote_count로 한 번 더 필터링해서 5개를 채움
+# =========================
+def fetch_enough_movies(api_key: str, base_params: dict, need: int, *, vote_count_floor: int | None = None, max_pages: int = 5):
+    collected = []
+    seen = set()
+
+    for page in range(1, max_pages + 1):
+        params = dict(base_params)
+        params["page"] = page
+
+        items = discover(api_key, params)
+        if not items:
+            break
+
+        for m in items:
+            mid = m.get("id")
+            title = (m.get("title") or m.get("original_title") or "").strip()
+            if not mid or not title:
+                continue
+            if mid in seen:
+                continue
+
+            # ✅ 여기서 확실히 필터 적용
+            if vote_count_floor is not None:
+                vc = int(m.get("vote_count") or 0)
+                if vc < vote_count_floor:
+                    continue
+
+            seen.add(mid)
+            collected.append(m)
+            if len(collected) >= need:
+                return collected
+
+    return collected
+
+
+def enrich_movies(api_key: str, items: list, pbase: str, mix, scores):
+    out = []
+    for m in items:
+        overview = pick_best_overview(api_key, m)
+        m2 = dict(m)
+        m2["_poster_base"] = pbase
+        m2["_overview_final"] = overview
+        m2["_reason"] = build_reason(mix, scores, m2)
+        out.append(m2)
+    return out
+
+
+# =========================
 # 추천 실행
 # =========================
-def run_recommendation():
+if submit:
     st.session_state.error = ""
     st.session_state.submitted = True
     st.session_state.rec_popular = []
@@ -483,84 +474,73 @@ def run_recommendation():
 
     if not api_key.strip():
         st.session_state.error = "TMDB API Key를 사이드바에 입력해 주세요."
-        return
+    else:
+        analysis = analyze_answers(st.session_state.answers)
+        st.session_state.analysis = analysis
 
-    analysis = analyze_answers(st.session_state.answers)
-    st.session_state.analysis = analysis
+        mix = analysis["mix"]
+        scores = analysis["scores"]
+        with_genres = with_genres_from_mix(mix)
 
-    mix = analysis["mix"]
-    scores = analysis["scores"]
-    with_genres = with_genres_from_mix(mix)
+        pbase = poster_base_url(api_key.strip(), "w500")
 
-    pbase = poster_base_url(api_key.strip(), "w500")
+        popular_params = {
+            "with_genres": with_genres,
+            "language": language,
+            "sort_by": "popularity.desc",
+            "include_adult": False,
+        }
+        if region_val:
+            popular_params["region"] = region_val
+        if year_val:
+            popular_params["year"] = year_val
 
-    popular_params = {
-        "with_genres": with_genres,
-        "language": language,
-        "sort_by": "popularity.desc",
-        "include_adult": False,
-        "page": 1,
-    }
-    toprated_params = {
-        "with_genres": with_genres,
-        "language": language,
-        "sort_by": "vote_average.desc",
-        "vote_count.gte": vote_count_min,
-        "include_adult": False,
-        "page": 1,
-    }
-    if region_val:
-        popular_params["region"] = region_val
-        toprated_params["region"] = region_val
-    if year_val:
-        popular_params["year"] = year_val
-        toprated_params["year"] = year_val
+        # 호평작: 평점순 + 투표수 필터
+        # vote_count.gte 자체도 넣되(서버 필터), 클라이언트에서 한 번 더 걸러서 “확실히”
+        toprated_params = {
+            "with_genres": with_genres,
+            "language": language,
+            "sort_by": "vote_average.desc",
+            "vote_count.gte": vote_count_min,  # 공식 discover 파라미터 :contentReference[oaicite:1]{index=1}
+            "include_adult": False,
+        }
+        if region_val:
+            toprated_params["region"] = region_val
+        if year_val:
+            toprated_params["year"] = year_val
 
-    with st.spinner("분석 중... (TMDB에서 추천을 불러오는 중)"):
-        try:
-            pop = discover(api_key.strip(), popular_params)[:12]
-            top = discover(api_key.strip(), toprated_params)[:12]
+        with st.spinner("분석 중... (TMDB에서 추천을 불러오는 중)"):
+            try:
+                # 대중픽은 5개만 확보
+                pop5 = fetch_enough_movies(api_key.strip(), popular_params, need=5, vote_count_floor=None, max_pages=3)
 
-            def pick5(items: list) -> list:
-                seen = set()
-                picked = []
-                for m in items:
-                    mid = m.get("id")
-                    title = (m.get("title") or m.get("original_title") or "").strip()
-                    if not mid or not title or mid in seen:
-                        continue
-                    seen.add(mid)
-                    picked.append(m)
-                    if len(picked) >= 5:
-                        break
-                return picked
+                # ✅ 호평작은 vote_count_min을 “확실히” 만족하는 5개를 확보 (여러 페이지 탐색)
+                top5 = fetch_enough_movies(
+                    api_key.strip(),
+                    toprated_params,
+                    need=5,
+                    vote_count_floor=vote_count_min,  # ✅ 클라이언트 재필터
+                    max_pages=8,
+                )
 
-            def enrich(items: list) -> list:
-                out = []
-                for m in items:
-                    overview = pick_best_overview(api_key.strip(), m, prefer_lang=language)
-                    m2 = dict(m)
-                    m2["_poster_base"] = pbase
-                    m2["_overview_final"] = overview
-                    m2["_reason"] = build_reason(mix, scores, m2)
-                    out.append(m2)
-                return out
+                st.session_state.rec_popular = enrich_movies(api_key.strip(), pop5, pbase, mix, scores)
+                st.session_state.rec_toprated = enrich_movies(api_key.strip(), top5, pbase, mix, scores)
 
-            st.session_state.rec_popular = enrich(pick5(pop))
-            st.session_state.rec_toprated = enrich(pick5(top))
+                # 사용자가 “너무 높게” 잡아서 후보가 부족하면 안내
+                if vote_count_min > 0 and len(top5) < 5:
+                    st.warning(
+                        f"호평작 조건(vote_count ≥ {vote_count_min})을 만족하는 영화가 충분하지 않아 "
+                        f"{len(top5)}개만 표시했어요. 투표수 기준을 낮추면 더 많이 나와요."
+                    )
 
-        except requests.HTTPError as e:
-            st.session_state.error = f"TMDB 요청 실패(HTTPError): {e}"
-        except Exception as e:
-            st.session_state.error = f"영화 정보를 가져오지 못했어요: {e}"
-
-
-if submit:
-    run_recommendation()
+            except requests.HTTPError as e:
+                st.session_state.error = f"TMDB 요청 실패(HTTPError): {e}"
+            except Exception as e:
+                st.session_state.error = f"영화 정보를 가져오지 못했어요: {e}"
 
 
 # =========================
-# 결과 출력 (요약 카드 -> 탭 -> 카드 리스트)
+# 결과 출력
 # =========================
 if st.session_state.submitted:
     st.write("")
@@ -571,7 +551,6 @@ if st.session_state.submitted:
         mix = analysis.get("mix", [])
         scores = analysis.get("scores", {})
 
-        # 요약 카드
         try:
             summary = st.container(border=True)
         except TypeError:
@@ -582,8 +561,7 @@ if st.session_state.submitted:
             chips = []
             for g, w in mix:
                 chips.append(f'<span class="badge badge-strong">{g} {int(round(w*100))}%</span>')
-            if chips:
-                st.markdown("".join(chips), unsafe_allow_html=True)
+            st.markdown("".join(chips) if chips else '<span class="badge">분석 결과 없음</span>', unsafe_allow_html=True)
             st.markdown(
                 '<div class="small-muted">대학생 무드로 요약하면: <b>과제/시험 끝나고 뇌 비우거나 몰입하기 좋은 타입</b> 😎</div>',
                 unsafe_allow_html=True,
@@ -594,13 +572,14 @@ if st.session_state.submitted:
 
         def render_movies(items: list):
             if not items:
-                st.info("추천 결과가 비어있어요. (지역/연도/투표수 옵션을 바꿔 다시 시도해보세요.)")
+                st.info("추천 결과가 비어있어요. (옵션을 바꿔 다시 시도해보세요.)")
                 return
 
             for m in items:
                 title = (m.get("title") or m.get("original_title") or "제목 없음").strip()
                 rating = float(m.get("vote_average") or 0.0)
                 vote_count = int(m.get("vote_count") or 0)
+
                 overview = (m.get("_overview_final") or "").strip()
                 poster_path = m.get("poster_path")
                 pbase = m.get("_poster_base") or "https://image.tmdb.org/t/p/w500"
