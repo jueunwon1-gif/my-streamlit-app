@@ -149,4 +149,306 @@ def get_poster_base(api_key: str, preferred_size: str = "w500") -> str:
             size = preferred_size
         else:
             # w500이 없을 때를 대비해 중간값에 가까운 사이즈 선택
-            size = "w500" if "w500" in sizes else (
+            size = "w500" if "w500" in sizes else (sizes[len(sizes)//2] if sizes else "w500")
+
+        return f"{base_url}{size}"
+    except Exception:
+        return fallback
+
+
+# =========================
+# TMDB discover/movie 호출 (상위 장르 1~2개 OR 검색)
+# with_genres는 여러 값을 받을 수 있고, 파이프(|)는 OR 개념으로 사용됨 :contentReference[oaicite:7]{index=7}
+# =========================
+@st.cache_data(ttl=60 * 30, show_spinner=False)
+def discover_movies_requests(api_key: str, with_genres: str, language: str, region: str | None, year: int | None):
+    session = get_http_session()
+    url = "https://api.themoviedb.org/3/discover/movie"
+    params = {
+        "api_key": api_key,
+        "with_genres": with_genres,
+        "language": language,
+        "sort_by": "popularity.desc",
+        "include_adult": "false",
+        "page": 1,
+    }
+    if region:
+        params["region"] = region
+    if year:
+        params["year"] = year
+
+    r = session.get(url, params=params, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    return (data.get("results") or [])[:5]
+
+
+@st.cache_data(ttl=60 * 30, show_spinner=False)
+def discover_movies_tmdbsimple(api_key: str, with_genres: str, language: str, region: str | None, year: int | None):
+    # tmdbsimple은 v3 래퍼로, 엔드포인트와 1:1로 매핑하는 형태 :contentReference[oaicite:8]{index=8}
+    tmdb.API_KEY = api_key
+    d = tmdb.Discover()
+    kwargs = {
+        "with_genres": with_genres,
+        "language": language,
+        "sort_by": "popularity.desc",
+        "include_adult": False,
+        "page": 1,
+    }
+    if region:
+        kwargs["region"] = region
+    if year:
+        kwargs["year"] = year
+
+    data = d.movie(**kwargs)
+    results = (data.get("results") or [])[:5]
+    return results
+
+
+def discover_top5(api_key: str, with_genres: str, language: str, region: str | None, year: int | None):
+    if TMDBSIMPLE_AVAILABLE:
+        return discover_movies_tmdbsimple(api_key, with_genres, language, region, year)
+    return discover_movies_requests(api_key, with_genres, language, region, year)
+
+
+# =========================
+# 분석: 답변 -> 장르 점수 -> 상위 2개 선택(고도화)
+# =========================
+def analyze_answers(answers: dict) -> dict:
+    scores = {g: 0 for g in GENRES.keys()}
+
+    for i, q in enumerate(questions, start=1):
+        key = f"q{i}"
+        selected = answers.get(key)
+        if not selected:
+            continue
+        idx = q["options"].index(selected)
+        for g, v in CHOICE_SCORE.get(idx, {}).items():
+            scores[g] += v
+
+    # 상위 2개(동점이면 우선순위로 정리)
+    priority = ["로맨스", "드라마", "코미디", "액션", "판타지", "SF"]
+
+    sorted_genres = sorted(
+        scores.items(),
+        key=lambda kv: (kv[1], -priority.index(kv[0]) if kv[0] in priority else -999),
+        reverse=True,
+    )
+
+    top1, top2 = sorted_genres[0][0], sorted_genres[1][0]
+    # top2가 0점이면 굳이 섞지 않음
+    top = [top1] if scores[top2] == 0 else [top1, top2]
+
+    return {"scores": scores, "top_genres": top}
+
+
+def build_reason(top_genres: list[str], scores: dict, movie: dict) -> str:
+    """
+    '이 영화를 추천하는 이유'를 간단히:
+    - 상위 장르(들) + 영화 평점 기반
+    """
+    labels = ", ".join(top_genres)
+    strength = "/".join([f"{g} {scores.get(g,0)}점" for g in top_genres])
+    rating = float(movie.get("vote_average") or 0)
+
+    if rating >= 7.5:
+        return f"당신의 선호 장르({labels}) 성향({strength})과 잘 맞고, 평점도 높아 만족도가 높을 확률이 커요."
+    if rating >= 6.5:
+        return f"당신의 선호 장르({labels}) 분위기({strength})에 잘 맞는 인기작이라 가볍게 시작하기 좋아요."
+    return f"당신의 선호 장르({labels}) 성향({strength})을 반영해, 요즘 많이 보는 인기 영화 중에서 골랐어요."
+
+
+def clamp(text: str, n: int = 220) -> str:
+    if not text:
+        return "줄거리 정보가 없습니다."
+    return text if len(text) <= n else text[:n].rstrip() + "…"
+
+
+# =========================
+# 세션 상태
+# =========================
+if "answers" not in st.session_state:
+    st.session_state.answers = {}
+
+if "submitted" not in st.session_state:
+    st.session_state.submitted = False
+
+if "movies" not in st.session_state:
+    st.session_state.movies = []
+
+if "analysis" not in st.session_state:
+    st.session_state.analysis = {"scores": {g: 0 for g in GENRES}, "top_genres": []}
+
+if "error" not in st.session_state:
+    st.session_state.error = ""
+
+
+def reset_test():
+    st.session_state.answers = {}
+    st.session_state.submitted = False
+    st.session_state.movies = []
+    st.session_state.analysis = {"scores": {g: 0 for g in GENRES}, "top_genres": []}
+    st.session_state.error = ""
+
+    for i in range(1, len(questions) + 1):
+        k = f"q{i}"
+        if k in st.session_state:
+            del st.session_state[k]
+
+
+# =========================
+# Sidebar: API Key + 옵션
+# =========================
+with st.sidebar:
+    st.header("🔑 TMDB 설정")
+
+    api_key = st.text_input("TMDB API Key", type="password", placeholder="사이드바에 API Key 입력")
+    st.caption("Key는 앱에 저장되지 않고 현재 세션에서만 사용됩니다.")
+
+    st.divider()
+    st.subheader("⚙️ 추천 옵션 (고도화)")
+    language = st.selectbox("언어(language)", ["ko-KR", "en-US"], index=0)
+    region = st.selectbox("지역(region)", ["(미사용)", "KR", "US", "JP"], index=1)
+    region_val = None if region == "(미사용)" else region
+
+    use_year = st.checkbox("특정 연도만 보기(선택)", value=False)
+    year_val = None
+    if use_year:
+        year_val = st.number_input("개봉 연도", min_value=1960, max_value=2030, value=2020, step=1)
+
+    st.divider()
+    if not TMDBSIMPLE_AVAILABLE:
+        st.info("참고: tmdbsimple 미설치로 requests 방식으로 호출 중입니다. (선택) `pip install tmdbsimple`")
+    else:
+        st.success("tmdbsimple 래퍼를 사용 중입니다. (코드가 더 단순/견고해짐)")
+
+    st.button("다시 테스트하기", on_click=reset_test)
+
+
+st.divider()
+
+# =========================
+# 질문 화면
+# =========================
+for i, q in enumerate(questions, start=1):
+    key = f"q{i}"
+
+    # 초기값: 첫 옵션
+    if key not in st.session_state.answers:
+        st.session_state.answers[key] = q["options"][0]
+
+    st.subheader(q["q"])
+    selected = st.radio(
+        label=key,
+        options=q["options"],
+        key=key,
+        label_visibility="collapsed",
+    )
+    st.session_state.answers[key] = selected
+    st.write("")
+
+st.divider()
+
+col1, col2, col3 = st.columns([1, 1, 2])
+with col1:
+    submit = st.button("결과 보기", type="primary")
+with col2:
+    st.button("다시 테스트하기", on_click=reset_test)
+with col3:
+    st.caption("결과 보기 클릭 시 TMDB에서 인기 영화 데이터를 가져옵니다.")
+
+# =========================
+# 결과 처리
+# =========================
+if submit:
+    st.session_state.error = ""
+    st.session_state.submitted = True
+    st.session_state.movies = []
+    st.session_state.analysis = {"scores": {g: 0 for g in GENRES}, "top_genres": []}
+
+    if not api_key.strip():
+        st.session_state.error = "TMDB API Key를 사이드바에 입력해 주세요."
+    else:
+        analysis = analyze_answers(st.session_state.answers)
+        st.session_state.analysis = analysis
+
+        # 상위 1~2개 장르로 OR 검색: 예) "10749|18"
+        top_genres = analysis["top_genres"]
+        with_genres = "|".join(str(GENRES[g]) for g in top_genres)
+
+        # 포스터 base_url 구성 (configuration 기반) :contentReference[oaicite:9]{index=9}
+        poster_base = get_poster_base(api_key.strip(), preferred_size="w500")
+
+        with st.spinner("분석 중... (TMDB에서 인기 영화를 불러오는 중)"):
+            try:
+                movies = discover_top5(
+                    api_key=api_key.strip(),
+                    with_genres=with_genres,
+                    language=language,
+                    region=region_val,
+                    year=year_val,
+                )
+                # poster_base를 각 영화 표시에서 사용하기 위해 세션에 저장해도 되지만,
+                # 여기서는 아래 출력에서 local 변수로 사용
+                st.session_state.movies = [{"_poster_base": poster_base, **m} for m in movies]
+
+            except requests.HTTPError as e:
+                st.session_state.error = f"TMDB 요청 실패(HTTPError): {e}"
+            except Exception as e:
+                st.session_state.error = f"영화 정보를 가져오지 못했어요: {e}"
+
+# =========================
+# 결과 출력
+# =========================
+if st.session_state.submitted:
+    if st.session_state.error:
+        st.error(st.session_state.error)
+    else:
+        top_genres = st.session_state.analysis.get("top_genres", [])
+        scores = st.session_state.analysis.get("scores", {})
+
+        st.subheader("✅ 분석 결과")
+        if top_genres:
+            st.success(f"당신의 선호 장르는 **{', '.join(top_genres)}** 쪽이에요!")
+        else:
+            st.info("분석 결과가 비어있어요. 다시 시도해 주세요.")
+
+        with st.expander("🧾 답변/점수 보기"):
+            st.write("### 내 답변")
+            for i, q in enumerate(questions, start=1):
+                k = f"q{i}"
+                st.write(f"**{q['q']}**")
+                st.write(f"- {st.session_state.answers.get(k, '미선택')}")
+            st.write("### 장르 점수")
+            st.json(scores)
+
+        st.divider()
+        st.subheader("🎥 추천 영화 TOP 5")
+
+        movies = st.session_state.movies
+        if not movies:
+            st.info("추천 결과가 아직 없어요. API Key가 올바른지 확인하고 다시 눌러주세요.")
+        else:
+            for m in movies:
+                poster_base = m.get("_poster_base") or "https://image.tmdb.org/t/p/w500"
+                title = m.get("title") or m.get("original_title") or "제목 없음"
+                rating = float(m.get("vote_average") or 0)
+                overview = clamp(m.get("overview") or "", 240)
+
+                poster_path = m.get("poster_path")
+                poster_url = f"{poster_base}{poster_path}" if poster_path else None
+
+                c1, c2 = st.columns([1, 2])
+                with c1:
+                    if poster_url:
+                        st.image(poster_url, use_container_width=True)
+                    else:
+                        st.caption("포스터 없음")
+
+                with c2:
+                    st.markdown(f"### {title}")
+                    st.markdown(f"**평점:** {rating:.1f} / 10")
+                    st.write(overview)
+                    st.info("💡 이 영화를 추천하는 이유: " + build_reason(top_genres, scores, m))
+
+                st.divider()
