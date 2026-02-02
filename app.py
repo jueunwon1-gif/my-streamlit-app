@@ -1,4 +1,3 @@
-import math
 import streamlit as st
 import requests
 from requests.adapters import HTTPAdapter
@@ -13,9 +12,35 @@ except Exception:
 
 
 # =========================
-# 페이지 설정
+# 페이지 설정 + 간단 CSS
 # =========================
 st.set_page_config(page_title="🎬 나와 어울리는 영화는?", page_icon="🎬", layout="wide")
+
+st.markdown(
+    """
+<style>
+/* 전체 폭과 여백 */
+.block-container {max-width: 1100px; padding-top: 1.2rem; padding-bottom: 3rem;}
+/* 제목 아래 간격 */
+h1 {margin-bottom: 0.2rem;}
+/* 라디오 간격 */
+div[role="radiogroup"] {gap: 0.25rem;}
+/* 구분선 여백 */
+hr {margin: 1.0rem 0 1.0rem 0;}
+/* 뱃지 */
+.badge{
+  display:inline-block; padding:6px 10px; border-radius:999px;
+  background: #f1f5f9; border:1px solid #e2e8f0; font-weight:700; font-size:12px;
+  margin-right: 6px; margin-bottom: 6px;
+}
+.badge-strong{ background:#ecfeff; border-color:#a5f3fc; }
+.badge-warn{ background:#fff7ed; border-color:#fed7aa; }
+.small-muted{ color:#64748b; font-size: 0.92rem; }
+.card-title{ font-size:1.05rem; font-weight:800; margin:0 0 0.35rem 0; }
+</style>
+""",
+    unsafe_allow_html=True,
+)
 
 # =========================
 # 장르 ID (요구사항)
@@ -30,12 +55,7 @@ GENRES = {
 }
 
 # =========================
-# 질문 (이전 대화에서 만든 질문)
-# 선택지 4개는 각각:
-# - 로맨스/드라마
-# - 액션/어드벤처(=액션으로 수렴)
-# - SF/판타지
-# - 코미디
+# 질문 데이터
 # =========================
 questions = [
     {
@@ -85,21 +105,18 @@ questions = [
     },
 ]
 
-# 선택지 인덱스 -> 장르 점수 매핑
-# 고도화: 액션/코미디는 강하게(+2), 로맨스/드라마 & SF/판타지는 2장르로 분배(+1씩)
+# 선택지 인덱스 -> 장르 점수 (로맨스/드라마, SF/판타지는 1점씩 분배)
 CHOICE_SCORE = {
     0: {"로맨스": 1, "드라마": 1},
     1: {"액션": 2},
     2: {"SF": 1, "판타지": 1},
     3: {"코미디": 2},
 }
-
-# 동점 처리 우선순위(원하면 조정)
 PRIORITY = ["로맨스", "드라마", "코미디", "액션", "판타지", "SF"]
 
 
 # =========================
-# HTTP 세션 (리트라이 포함)
+# HTTP 세션 (리트라이)
 # =========================
 @st.cache_resource
 def get_http_session():
@@ -118,7 +135,7 @@ def get_http_session():
 
 
 # =========================
-# TMDB 공통 호출
+# TMDB: configuration -> 이미지 URL
 # =========================
 @st.cache_data(ttl=60 * 60, show_spinner=False)
 def tmdb_configuration(api_key: str):
@@ -149,27 +166,24 @@ def poster_base_url(api_key: str, preferred_size="w500") -> str:
         return fallback
 
 
+# =========================
+# TMDB: discover/movie + movie detail (ko 비면 en 보조)
+# =========================
 @st.cache_data(ttl=60 * 20, show_spinner=False)
 def discover_requests(api_key: str, params: dict) -> list:
     session = get_http_session()
     url = "https://api.themoviedb.org/3/discover/movie"
-    base_params = {
-        "api_key": api_key,
-        "include_adult": "false",
-        "page": 1,
-    }
+    base_params = {"api_key": api_key, "include_adult": "false", "page": 1}
     base_params.update(params)
     r = session.get(url, params=base_params, timeout=15)
     r.raise_for_status()
-    data = r.json() or {}
-    return data.get("results", []) or []
+    return (r.json() or {}).get("results", []) or []
 
 
 @st.cache_data(ttl=60 * 20, show_spinner=False)
 def discover_tmdbsimple(api_key: str, params: dict) -> list:
     tmdb.API_KEY = api_key
     d = tmdb.Discover()
-    # tmdbsimple은 파라미터를 그대로 넘겨도 됨 (bool은 bool로)
     data = d.movie(**params)
     return data.get("results", []) or []
 
@@ -202,8 +216,23 @@ def movie_details(api_key: str, movie_id: int, language: str) -> dict:
     return movie_details_requests(api_key, movie_id, language)
 
 
+def pick_best_overview(api_key: str, movie: dict, prefer_lang: str = "ko-KR") -> str:
+    overview = (movie.get("overview") or "").strip()
+    if overview:
+        return overview
+    mid = movie.get("id")
+    if not mid:
+        return ""
+    try:
+        # ko가 비면 en-US 보조
+        detail_en = movie_details(api_key, int(mid), "en-US")
+        return (detail_en.get("overview") or "").strip()
+    except Exception:
+        return ""
+
+
 # =========================
-# 분석: 답변 -> 점수 -> 상위 장르 + 혼합 비율
+# 분석: 점수 -> 상위 2개 + 혼합 비율 + with_genres OR
 # =========================
 def analyze_answers(answers: dict) -> dict:
     scores = {g: 0 for g in GENRES.keys()}
@@ -217,19 +246,18 @@ def analyze_answers(answers: dict) -> dict:
         for g, v in CHOICE_SCORE.get(idx, {}).items():
             scores[g] += v
 
-    # 점수 정렬 (동점은 PRIORITY로 해결)
     def pri(g: str) -> int:
         return PRIORITY.index(g) if g in PRIORITY else 999
 
-    sorted_items = sorted(scores.items(), key=lambda kv: (kv[1], -1000 + (-pri(kv[0]))), reverse=True)
+    sorted_items = sorted(
+        scores.items(),
+        key=lambda kv: (kv[1], -pri(kv[0])),
+        reverse=True,
+    )
     top1, s1 = sorted_items[0]
     top2, s2 = sorted_items[1]
 
-    # 혼합 전략:
-    # - top2가 0점이면 단독
-    # - top1과 top2의 점수 차이가 1 이하이면 섞기(70/30 또는 60/40)
-    # - 차이가 2 이상이면 top1 위주(80/20 정도) or 단독
-    mix = []
+    # 혼합 비율: 점수 차이가 작을수록 더 섞기
     if s2 <= 0:
         mix = [(top1, 1.0)]
     else:
@@ -243,80 +271,40 @@ def analyze_answers(answers: dict) -> dict:
         else:
             mix = [(top1, 0.8), (top2, 0.2)]
 
-    return {
-        "scores": scores,
-        "top1": top1,
-        "top2": top2,
-        "mix": mix,  # [(genre, weight), ...]
-    }
+    return {"scores": scores, "mix": mix, "top1": top1, "top2": top2}
 
 
 def with_genres_from_mix(mix: list[tuple[str, float]]) -> str:
-    # OR 검색: "10749|18"처럼 파이프(|) 사용
+    # OR 검색: "10749|18"
     ids = [str(GENRES[g]) for g, w in mix if w > 0]
     return "|".join(ids)
 
 
-def clamp(text: str, n: int = 240) -> str:
+def clamp(text: str, n: int = 260) -> str:
     if not text:
-        return ""
+        return "줄거리 정보가 없습니다."
     return text if len(text) <= n else text[:n].rstrip() + "…"
 
 
-def pick_best_overview(api_key: str, movie: dict, prefer_lang: str = "ko-KR") -> str:
-    """
-    고도화: ko-KR overview가 비면 en-US로 보조 조회(추가 호출 최소화: 필요할 때만)
-    """
-    overview = (movie.get("overview") or "").strip()
-    if overview:
-        return overview
-
-    mid = movie.get("id")
-    if not mid:
-        return ""
-
-    # 보조 조회
-    try:
-        detail_en = movie_details(api_key, int(mid), "en-US")
-        return (detail_en.get("overview") or "").strip()
-    except Exception:
-        return ""
-
-
-def build_reason(mix: list[tuple[str, float]], scores: dict, movie: dict, user_context_hint: str) -> str:
-    """
-    고도화:
-    - 혼합 비율(장르 mix)을 문장에 반영
-    - 평점/투표수 기반으로 "호평작/대중픽" 느낌 반영
-    - 대학생 컨텍스트(시험/새학기/친구/힐링) 힌트를 가볍게 섞음
-    """
-    parts = []
-    for g, w in mix:
-        if w <= 0:
-            continue
-        pct = int(round(w * 100))
-        parts.append(f"{g} {pct}%")
-    mix_str = " + ".join(parts)
+def build_reason(mix: list[tuple[str, float]], scores: dict, movie: dict) -> str:
+    # 대학생 마이크로카피 + 대중픽/호평작 느낌
+    parts = [f"{g} {int(round(w*100))}%" for g, w in mix if w > 0]
+    mix_str = " + ".join(parts) if parts else "취향 믹스"
 
     rating = float(movie.get("vote_average") or 0.0)
     vote_count = int(movie.get("vote_count") or 0)
 
-    tone = ""
     if rating >= 7.6 and vote_count >= 500:
-        tone = "평점도 높고(호평), 어느 정도 검증된 작품이라"
+        tone = "평점도 높고 반응도 탄탄해서"
     elif vote_count >= 2000:
-        tone = "요즘 많이들 보는 대중픽 라인이라"
+        tone = "요즘 많이들 보는 대중픽이라"
     elif rating >= 7.0:
-        tone = "기본 평점이 안정적이라"
+        tone = "평점이 안정적이라"
     else:
-        tone = "가볍게 보기 좋은 인기작 중에서"
+        tone = "가볍게 즐기기 좋은 인기작이라"
 
     strength = ", ".join([f"{g}:{scores.get(g,0)}" for g, _ in mix])
-    context = user_context_hint.strip()
-    if context:
-        context = f" {context}"
-
-    return f"당신의 취향 믹스({mix_str}, 점수 {strength})에 맞고, {tone}{context} 추천해요."
+    return f"당신의 취향({mix_str}, 점수 {strength})에 잘 맞고, {tone} 과제/시험 끝나고 보기 딱 좋아요."
 
 
 # =========================
@@ -355,25 +343,38 @@ def reset_test():
 
 
 # =========================
-# UI: Sidebar
+# Sidebar: 설정만 깔끔하게
 # =========================
 with st.sidebar:
     st.header("🔑 TMDB 설정")
-    api_key = st.text_input("TMDB API Key", type="password", placeholder="여기에 API Key 입력")
-    st.caption("API Key는 저장되지 않고 현재 세션에서만 사용됩니다.")
+    api_key = st.text_input("TMDB API Key", type="password", placeholder="API Key를 입력하세요")
+    st.caption("Key는 저장되지 않고 현재 세션에서만 사용됩니다.")
     st.divider()
 
-    st.subheader("⚙️ 추천 고도화 옵션")
-    language = st.selectbox("기본 언어", ["ko-KR", "en-US"], index=0)
-    region = st.selectbox("지역(region)", ["(미사용)", "KR", "US", "JP"], index=1)
-    region_val = None if region == "(미사용)" else region
+    with st.expander("고급 옵션", expanded=False):
+        language = st.selectbox("기본 언어", ["ko-KR", "en-US"], index=0)
+        region = st.selectbox("지역(region)", ["(미사용)", "KR", "US", "JP"], index=1)
+        region_val = None if region == "(미사용)" else region
 
-    # 결과 다양화 옵션
-    vote_count_min = st.slider("호평작 최소 투표수(vote_count.gte)", min_value=0, max_value=5000, value=500, step=50)
-    show_year_filter = st.checkbox("특정 연도만 추천", value=False)
-    year_val = None
-    if show_year_filter:
-        year_val = st.number_input("개봉 연도", min_value=1960, max_value=2030, value=2020, step=1)
+        vote_count_min = st.slider(
+            "호평작 최소 투표수(vote_count.gte)",
+            min_value=0,
+            max_value=5000,
+            value=500,
+            step=50,
+        )
+
+        show_year_filter = st.checkbox("특정 연도만 추천", value=False)
+        year_val = None
+        if show_year_filter:
+            year_val = st.number_input("개봉 연도", min_value=1960, max_value=2030, value=2020, step=1)
+
+    if "language" not in locals():
+        # expander 안 열었을 때 대비 기본값
+        language = "ko-KR"
+        region_val = "KR"
+        vote_count_min = 500
+        year_val = None
 
     st.divider()
     if TMDBSIMPLE_AVAILABLE:
@@ -385,39 +386,90 @@ with st.sidebar:
 
 
 # =========================
-# UI: Main
+# 메인 상단: 인트로 + CTA
 # =========================
-st.title("🎬 나와 어울리는 영화는?")
-st.write("질문 5개에 답하면, 답변을 분석해 **장르를 혼합**해서 더 정확하게 추천해드려요! 🍿")
-st.caption("고도화: 상위 장르 2개 혼합, 대중픽/호평작 탭 분리, 줄거리 한국어가 없으면 영어로 보조 조회")
+st.markdown("## 🎬 나와 어울리는 영화는?")
+st.markdown(
+    '<div class="small-muted">5문항 · 1분 컷! 지금 기분에 딱 맞는 영화 5개를 추천해줄게요 🍿</div>',
+    unsafe_allow_html=True,
+)
+
+st.write("")
+cta1, cta2 = st.columns([2, 1])
+with cta1:
+    st.markdown(
+        """
+- **결과 보기**를 누르면 답변을 분석해 장르를 섞어서 추천해요  
+- 추천은 **대중픽(인기순)** / **호평작(평점순)** 두 가지로 보여줘요
+"""
+    )
+with cta2:
+    st.markdown(
+        """
+<div class="badge badge-warn">TIP</div>
+<div class="small-muted">API Key는 사이드바에 입력!</div>
+""",
+        unsafe_allow_html=True,
+    )
 
 st.divider()
 
-# 질문 표시
-for i, q in enumerate(questions, start=1):
-    key = f"q{i}"
+
+# =========================
+# 질문 화면: 카드/컨테이너 느낌으로 정리 (단계형 X)
+# =========================
+def begin_card(title: str, subtitle: str | None = None):
+    try:
+        c = st.container(border=True)
+    except TypeError:
+        c = st.container()
+    with c:
+        st.markdown(f'<div class="card-title">{title}</div>', unsafe_allow_html=True)
+        if subtitle:
+            st.markdown(f'<div class="small-muted">{subtitle}</div>', unsafe_allow_html=True)
+        st.write("")
+    return c
+
+
+# 질문을 2열로 배치(시각적으로 덜 길어 보이게)
+left, right = st.columns(2, gap="large")
+
+for idx, q in enumerate(questions, start=1):
+    key = f"q{idx}"
     if key not in st.session_state.answers:
         st.session_state.answers[key] = q["options"][0]
 
-    st.subheader(q["q"])
-    selected = st.radio(
-        label=key,
-        options=q["options"],
-        key=key,
-        label_visibility="collapsed",
-    )
-    st.session_state.answers[key] = selected
-    st.write("")
+    target_col = left if idx in (1, 3, 5) else right
+
+    with target_col:
+        try:
+            box = st.container(border=True)
+        except TypeError:
+            box = st.container()
+        with box:
+            st.markdown(f"**{q['q']}**")
+            selected = st.radio(
+                label=key,
+                options=q["options"],
+                key=key,
+                label_visibility="collapsed",
+            )
+            st.session_state.answers[key] = selected
 
 st.divider()
 
-c1, c2, c3 = st.columns([1, 1, 2])
-with c1:
-    submit = st.button("결과 보기", type="primary")
-with c2:
-    st.button("다시 테스트하기", on_click=reset_test)
-with c3:
-    st.caption("결과 보기 클릭 시 TMDB에서 데이터를 가져옵니다.")
+
+# =========================
+# 하단: 버튼 영역 (고정된 느낌)
+# =========================
+b1, b2, b3 = st.columns([1.2, 1.2, 2.6])
+with b1:
+    submit = st.button("결과 보기", type="primary", use_container_width=True)
+with b2:
+    st.button("다시 테스트하기", on_click=reset_test, use_container_width=True)
+with b3:
+    st.markdown('<div class="small-muted">결과 보기 클릭 시 TMDB에서 데이터를 가져옵니다.</div>', unsafe_allow_html=True)
+
 
 # =========================
 # 추천 실행
@@ -440,14 +492,8 @@ def run_recommendation():
     scores = analysis["scores"]
     with_genres = with_genres_from_mix(mix)
 
-    # 대학생 컨텍스트 힌트(가볍게)
-    # (답변 내용에 따라 조금 바꿀 수 있지만, 일단 공통 문구를 짧게)
-    user_context_hint = "시험/과제 후 리프레시용으로 딱!"
-
-    # 포스터 base
     pbase = poster_base_url(api_key.strip(), "w500")
 
-    # 1) 대중픽: popularity.desc
     popular_params = {
         "with_genres": with_genres,
         "language": language,
@@ -455,7 +501,6 @@ def run_recommendation():
         "include_adult": False,
         "page": 1,
     }
-    # 2) 호평작: vote_average.desc + vote_count.gte
     toprated_params = {
         "with_genres": with_genres,
         "language": language,
@@ -464,7 +509,6 @@ def run_recommendation():
         "include_adult": False,
         "page": 1,
     }
-
     if region_val:
         popular_params["region"] = region_val
         toprated_params["region"] = region_val
@@ -474,10 +518,9 @@ def run_recommendation():
 
     with st.spinner("분석 중... (TMDB에서 추천을 불러오는 중)"):
         try:
-            pop = discover(api_key.strip(), popular_params)[:12]   # 후보를 넉넉히 받아 중복/빈 줄거리 보정
+            pop = discover(api_key.strip(), popular_params)[:12]
             top = discover(api_key.strip(), toprated_params)[:12]
 
-            # 후보에서 5개 뽑기: 포스터/제목 존재 우선, 중복 제거
             def pick5(items: list) -> list:
                 seen = set()
                 picked = []
@@ -492,23 +535,19 @@ def run_recommendation():
                         break
                 return picked
 
-            pop5 = pick5(pop)
-            top5 = pick5(top)
-
-            # 줄거리 보조 조회(ko-KR 비어있으면 en-US)
             def enrich(items: list) -> list:
                 out = []
                 for m in items:
                     overview = pick_best_overview(api_key.strip(), m, prefer_lang=language)
                     m2 = dict(m)
-                    m2["_overview_final"] = overview
                     m2["_poster_base"] = pbase
-                    m2["_reason"] = build_reason(mix, scores, m2, user_context_hint)
+                    m2["_overview_final"] = overview
+                    m2["_reason"] = build_reason(mix, scores, m2)
                     out.append(m2)
                 return out
 
-            st.session_state.rec_popular = enrich(pop5)
-            st.session_state.rec_toprated = enrich(top5)
+            st.session_state.rec_popular = enrich(pick5(pop))
+            st.session_state.rec_toprated = enrich(pick5(top))
 
         except requests.HTTPError as e:
             st.session_state.error = f"TMDB 요청 실패(HTTPError): {e}"
@@ -519,10 +558,12 @@ def run_recommendation():
 if submit:
     run_recommendation()
 
+
 # =========================
-# 결과 출력
+# 결과 출력 (요약 카드 -> 탭 -> 카드 리스트)
 # =========================
 if st.session_state.submitted:
+    st.write("")
     if st.session_state.error:
         st.error(st.session_state.error)
     else:
@@ -530,62 +571,58 @@ if st.session_state.submitted:
         mix = analysis.get("mix", [])
         scores = analysis.get("scores", {})
 
-        # 헤더: 취향 믹스 보여주기
-        st.subheader("✅ 분석 결과: 취향 믹스")
-        if mix:
+        # 요약 카드
+        try:
+            summary = st.container(border=True)
+        except TypeError:
+            summary = st.container()
+
+        with summary:
+            st.markdown("### ✅ 내 취향 요약")
             chips = []
             for g, w in mix:
-                chips.append(f"{g} {int(round(w*100))}%")
-            st.success(" + ".join(chips))
-        else:
-            st.info("분석 결과가 비어있어요. 다시 시도해 주세요.")
+                chips.append(f'<span class="badge badge-strong">{g} {int(round(w*100))}%</span>')
+            if chips:
+                st.markdown("".join(chips), unsafe_allow_html=True)
+            st.markdown(
+                '<div class="small-muted">대학생 무드로 요약하면: <b>과제/시험 끝나고 뇌 비우거나 몰입하기 좋은 타입</b> 😎</div>',
+                unsafe_allow_html=True,
+            )
 
-        # 디버그/설명
-        with st.expander("🧾 내 답변 + 점수 자세히 보기"):
-            st.write("### 내 답변")
-            for i, q in enumerate(questions, start=1):
-                k = f"q{i}"
-                st.write(f"**{q['q']}**")
-                st.write(f"- {st.session_state.answers.get(k, '미선택')}")
-            st.write("### 장르 점수")
-            st.json(scores)
-
-        st.divider()
-
+        st.write("")
         tab1, tab2 = st.tabs(["🔥 대중픽(인기순)", "🏆 호평작(평점순)"])
 
         def render_movies(items: list):
             if not items:
-                st.info("추천 결과가 비어있어요. 옵션(지역/연도/투표수)을 바꿔 다시 시도해보세요.")
+                st.info("추천 결과가 비어있어요. (지역/연도/투표수 옵션을 바꿔 다시 시도해보세요.)")
                 return
 
             for m in items:
                 title = (m.get("title") or m.get("original_title") or "제목 없음").strip()
-                rating = float(m.get("vote_average") or 0)
+                rating = float(m.get("vote_average") or 0.0)
                 vote_count = int(m.get("vote_count") or 0)
                 overview = (m.get("_overview_final") or "").strip()
-                if not overview:
-                    overview = "줄거리 정보가 없습니다."
-                overview = clamp(overview, 260)
-
                 poster_path = m.get("poster_path")
                 pbase = m.get("_poster_base") or "https://image.tmdb.org/t/p/w500"
                 poster_url = f"{pbase}{poster_path}" if poster_path else None
 
-                c1, c2 = st.columns([1, 2])
-                with c1:
-                    if poster_url:
-                        st.image(poster_url, use_container_width=True)
-                    else:
-                        st.caption("포스터 없음")
+                try:
+                    card = st.container(border=True)
+                except TypeError:
+                    card = st.container()
 
-                with c2:
-                    st.markdown(f"### {title}")
-                    st.markdown(f"**평점:** {rating:.1f} / 10  ·  **투표수:** {vote_count:,}")
-                    st.write(overview)
-                    st.info("💡 이 영화를 추천하는 이유: " + (m.get("_reason") or ""))
-
-                st.divider()
+                with card:
+                    c1, c2 = st.columns([1, 2], gap="large")
+                    with c1:
+                        if poster_url:
+                            st.image(poster_url, use_container_width=True)
+                        else:
+                            st.caption("포스터 없음")
+                    with c2:
+                        st.markdown(f"#### {title}")
+                        st.markdown(f"**평점:** {rating:.1f} / 10  ·  **투표수:** {vote_count:,}")
+                        st.write(clamp(overview, 260))
+                        st.info("💡 이 영화를 추천하는 이유: " + (m.get("_reason") or ""))
 
         with tab1:
             render_movies(st.session_state.rec_popular)
