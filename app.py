@@ -17,20 +17,16 @@ GENRES = {
     "판타지": 14,
 }
 
-# 선택지(4개)는 각각 장르 성향을 나타냄 (요구사항)
-# - 로맨스/드라마
-# - 액션/어드벤처
-# - SF/판타지
-# - 코미디
+# 선택지 인덱스 → 장르 성향 매핑
 CHOICE_GENRE_MAP = {
     0: ["로맨스", "드라마"],  # ❤️
-    1: ["액션"],             # 🔥 (어드벤처는 TMDB 장르 ID에 없으므로 액션으로 수렴)
+    1: ["액션"],             # 🔥
     2: ["SF", "판타지"],      # 🌌
     3: ["코미디"],            # 😂
 }
 
 # =========================
-# 질문 데이터 (이전 대화에서 만든 질문)
+# 질문 데이터
 # =========================
 questions = [
     {
@@ -84,198 +80,168 @@ questions = [
 # 세션 상태 초기화
 # =========================
 if "answers" not in st.session_state:
-    st.session_state.answers = {}  # {"q1": option_text, ...}
+    st.session_state.answers = {}
 
 if "submitted" not in st.session_state:
     st.session_state.submitted = False
 
-if "result_genre" not in st.session_state:
-    st.session_state.result_genre = None  # "액션"/"코미디"/...
-
 if "movies" not in st.session_state:
-    st.session_state.movies = []  # TMDB results (top 5)
+    st.session_state.movies = []
 
-if "analysis" not in st.session_state:
-    st.session_state.analysis = {}  # scoring details
+if "result_genre" not in st.session_state:
+    st.session_state.result_genre = None
+
+if "scores" not in st.session_state:
+    st.session_state.scores = {}
 
 
+# =========================
+# 초기화 함수
+# =========================
 def reset_test():
     st.session_state.answers = {}
     st.session_state.submitted = False
-    st.session_state.result_genre = None
     st.session_state.movies = []
-    st.session_state.analysis = {}
+    st.session_state.result_genre = None
+    st.session_state.scores = {}
 
-    # 라디오 상태 초기화(키 삭제)
-    for i in range(1, len(questions) + 1):
+    for i in range(1, 6):
         key = f"q{i}"
         if key in st.session_state:
             del st.session_state[key]
 
 
 # =========================
-# 로직: 답변 분석 -> 장르 결정
+# 답변 분석 함수
 # =========================
-def analyze_answers(answers: dict):
-    """
-    answers: {"q1": selected_text, ...}
-    선택지 인덱스를 기반으로 장르 점수 누적 후, 최종 장르 1개 선택
-    """
-    scores = {g: 0 for g in GENRES.keys()}  # 액션/코미디/드라마/SF/로맨스/판타지
-
-    # 우선순위(동점 처리)
-    # 대학생 대상 무난한 우선순위 예시 (원하면 바꿔도 됨)
-    priority = ["로맨스", "드라마", "코미디", "액션", "판타지", "SF"]
+def analyze_answers():
+    scores = {g: 0 for g in GENRES.keys()}
 
     for i, q in enumerate(questions, start=1):
         q_key = f"q{i}"
-        selected_text = answers.get(q_key)
-        if not selected_text:
-            continue
+        selected = st.session_state.answers.get(q_key)
 
-        # 해당 질문 options에서 몇 번째 선택지인지 찾기
-        try:
-            idx = q["options"].index(selected_text)
-        except ValueError:
-            continue
+        if selected:
+            idx = q["options"].index(selected)
+            mapped_genres = CHOICE_GENRE_MAP[idx]
 
-        mapped = CHOICE_GENRE_MAP.get(idx, [])
-        for g in mapped:
-            if g in scores:
-                # 로맨스/드라마처럼 2개가 매핑될 수 있으니 가중치를 조금 조정
-                # (로맨스/드라마 선택지는 2장르라 각 1점씩)
+            for g in mapped_genres:
                 scores[g] += 1
 
-    # 최종 장르: 최고 점수
-    best = None
-    for g in scores.keys():
-        if best is None:
-            best = g
-            continue
-        if scores[g] > scores[best]:
-            best = g
-        elif scores[g] == scores[best]:
-            # tie-break: priority 순서가 빠른 장르를 선택
-            a = priority.index(g) if g in priority else 999
-            b = priority.index(best) if best in priority else 999
-            if a < b:
-                best = g
-
-    return best, scores
+    best_genre = max(scores, key=scores.get)
+    return best_genre, scores
 
 
 # =========================
-# TMDB 호출
+# TMDB 영화 가져오기
 # =========================
-@st.cache_data(show_spinner=False, ttl=60 * 30)
-def fetch_top_movies(api_key: str, genre_id: int):
-    """
-    TMDB discover/movie로 인기 영화 5개 가져오기
-    """
+def fetch_movies(api_key, genre_id):
     url = (
-        "https://api.themoviedb.org/3/discover/movie"
+        f"https://api.themoviedb.org/3/discover/movie"
         f"?api_key={api_key}"
         f"&with_genres={genre_id}"
         f"&language=ko-KR"
         f"&sort_by=popularity.desc"
-        f"&include_adult=false"
-        f"&page=1"
     )
-    r = requests.get(url, timeout=15)
-    r.raise_for_status()
-    data = r.json()
-    results = data.get("results", []) or []
-    return results[:5]
 
+    response = requests.get(url)
+    data = response.json()
 
-def build_reason(result_genre: str, scores: dict, movie: dict):
-    """
-    간단 추천 이유(요구사항)
-    - 장르 점수 기반 + 영화 평점 기반
-    """
-    label = result_genre
-    g_score = scores.get(result_genre, 0)
-    rating = movie.get("vote_average", 0) or 0
-
-    if rating >= 7.5:
-        return f"당신의 답변이 '{label}' 성향({g_score}점)과 가장 잘 맞고, 평점도 높아 만족도가 높을 가능성이 커요."
-    if rating >= 6.5:
-        return f"'{label}' 무드({g_score}점)를 선호하는 편이라, 지금 기분 전환용으로 잘 맞을 것 같아요."
-    return f"당신의 선택이 '{label}' 분위기({g_score}점)에 가깝고, 인기 작품 중에서 가볍게 즐기기 좋은 영화예요."
-
-
-def clamp(text: str, n: int = 170):
-    if not text:
-        return "줄거리 정보가 없습니다."
-    return text if len(text) <= n else text[:n].rstrip() + "…"
+    return data["results"][:5]
 
 
 # =========================
-# UI
+# 추천 이유 생성
 # =========================
+def build_reason(genre):
+    return f"당신의 답변이 '{genre}' 성향과 가장 잘 맞아서 추천했어요!"
+
+
+# =========================
+# UI 시작
+# =========================
+
+# 사이드바
 with st.sidebar:
-    st.header("🔑 TMDB 설정")
-    api_key = st.text_input("TMDB API Key", type="password", placeholder="여기에 API Key를 입력하세요")
-    st.caption("API Key는 저장되지 않아요(현재 세션에서만 사용).")
-    st.divider()
+    st.header("🔑 TMDB API Key 입력")
+    api_key = st.text_input("API Key", type="password")
+
     st.button("다시 테스트하기", on_click=reset_test)
 
 st.title("🎬 나와 어울리는 영화는?")
-st.write("5개의 질문에 답하면, 당신의 취향에 맞는 장르를 분석해서 **TMDB 인기 영화 5개**를 추천해줘요! 🍿")
+st.write("질문에 답하면 TMDB에서 인기 영화 5개를 추천해드려요!")
 
 st.divider()
 
-# 질문 표시
-for i, item in enumerate(questions, start=1):
-    q_key = f"q{i}"
+# 질문 출력
+for i, q in enumerate(questions, start=1):
+    st.subheader(q["q"])
 
-    # 초기값 설정: 아직 답이 없으면 첫번째 옵션으로
-    if q_key not in st.session_state.answers:
-        st.session_state.answers[q_key] = item["options"][0]
-
-    st.subheader(item["q"])
     selected = st.radio(
-        label=q_key,
-        options=item["options"],
-        key=q_key,
-        label_visibility="collapsed",
+        label=f"q{i}",
+        options=q["options"],
+        key=f"q{i}",
+        label_visibility="collapsed"
     )
 
-    # 세션에 저장
-    st.session_state.answers[q_key] = selected
-    st.write("")
+    st.session_state.answers[f"q{i}"] = selected
 
 st.divider()
 
-col1, col2 = st.columns([1, 1])
+# 결과 보기 버튼
+if st.button("결과 보기", type="primary"):
 
-with col1:
-    result_clicked = st.button("결과 보기", type="primary")
-
-with col2:
-    st.caption("※ 결과 보기 클릭 시 TMDB에서 데이터를 가져옵니다.")
-
-# =========================
-# 결과 보기 로직
-# =========================
-if result_clicked:
-    st.session_state.submitted = True
-    st.session_state.movies = []
-    st.session_state.result_genre = None
-    st.session_state.analysis = {}
-
-    # 입력 검증
-    if not api_key.strip():
-        st.error("사이드바에 TMDB API Key를 입력해 주세요.")
+    if not api_key:
+        st.error("TMDB API Key를 입력해주세요!")
     else:
-        # 1) 답변 분석 -> 장르 결정
-        best_genre, scores = analyze_answers(st.session_state.answers)
-        st.session_state.result_genre = best_genre
-        st.session_state.analysis = scores
+        st.session_state.submitted = True
 
-        # 2) TMDB에서 인기 영화 5개 가져오기
-        with st.spinner("분석 중... (TMDB에서 영화를 불러오는 중)"):
+        # 1) 장르 분석
+        best_genre, scores = analyze_answers()
+        st.session_state.result_genre = best_genre
+        st.session_state.scores = scores
+
+        # 2) TMDB 영화 가져오기
+        with st.spinner("분석 중... 영화 추천 불러오는 중..."):
             try:
                 genre_id = GENRES[best_genre]
-                movies = fetch_top_movies(api_key.strip(), genre_id)
+                movies = fetch_movies(api_key, genre_id)
                 st.session_state.movies = movies
+
+            except Exception as e:
+                st.error("TMDB 영화 데이터를 불러오지 못했습니다.")
+                st.write(e)
+
+# =========================
+# 결과 출력
+# =========================
+if st.session_state.submitted:
+
+    st.subheader("✅ 당신에게 어울리는 장르")
+    st.success(f"🎭 {st.session_state.result_genre}")
+
+    st.subheader("🎥 추천 영화 TOP 5")
+
+    for movie in st.session_state.movies:
+
+        title = movie.get("title")
+        rating = movie.get("vote_average")
+        overview = movie.get("overview")
+        poster_path = movie.get("poster_path")
+
+        poster_url = POSTER_BASE + poster_path if poster_path else None
+
+        col1, col2 = st.columns([1, 2])
+
+        with col1:
+            if poster_url:
+                st.image(poster_url, use_container_width=True)
+
+        with col2:
+            st.markdown(f"### 🎬 {title}")
+            st.write(f"⭐ 평점: {rating}")
+            st.write(f"📖 줄거리: {overview[:200]}...")
+
+            st.info("💡 추천 이유: " + build_reason(st.session_state.result_genre))
+
+        st.divider()
