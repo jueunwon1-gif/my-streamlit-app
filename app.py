@@ -8,7 +8,7 @@ st.caption("※ 지금은 화면 구성 단계예요. 다음 시간에 TMDB API�
 
 st.divider()
 
-# 질문 데이터 (방금 위에서 만든 질문)
+# 질문 데이터
 questions = [
     {
         "q": "Q1. 시험 끝난 날, 내가 가장 하고 싶은 일은?",
@@ -57,24 +57,66 @@ questions = [
     },
 ]
 
-# 답변 저장 (세션 상태)
+# 세션 상태 초기화
 if "answers" not in st.session_state:
+    st.session_state.answers = {}  # {"q1": "...", "q2": "...", ...}
+
+if "submitted" not in st.session_state:
+    st.session_state.submitted = False
+
+
+def reset_test():
+    """테스트 초기화"""
     st.session_state.answers = {}
+    st.session_state.submitted = False
+
+    # 라디오 선택값도 초기화(키 삭제)
+    for i in range(1, len(questions) + 1):
+        key = f"q{i}"
+        if key in st.session_state:
+            del st.session_state[key]
+
 
 # 질문 표시
 for i, item in enumerate(questions, start=1):
+    q_key = f"q{i}"
+
+    # 답변이 이미 있으면 그 값을 기본값으로 유지
+    if q_key not in st.session_state.answers:
+        # 처음 렌더링 시 기본값을 첫 번째 선택지로 저장
+        st.session_state.answers[q_key] = item["options"][0]
+
     st.subheader(item["q"])
     selected = st.radio(
-        label=f"q{i}",
+        label=q_key,
         options=item["options"],
-        key=f"q{i}",
+        key=q_key,
         label_visibility="collapsed",
     )
-    st.session_state.answers[f"q{i}"] = selected
-    st.write("")  # 약간의 여백
+
+    # 세션 상태에 저장
+    st.session_state.answers[q_key] = selected
+    st.write("")
 
 st.divider()
 
-# 결과 보기 버튼
-if st.button("결과 보기", type="primary"):
-    st.info("분석 중...")
+# 버튼 영역
+col1, col2 = st.columns([1, 1])
+
+with col1:
+    if st.button("결과 보기", type="primary"):
+        st.session_state.submitted = True
+
+with col2:
+    st.button("다시 테스트하기", on_click=reset_test)
+
+# 결과 표시
+if st.session_state.submitted:
+    st.info("분석 중... (다음 시간에 TMDB 추천을 붙일 예정이에요)")
+
+    st.subheader("📝 내 답변 모아보기")
+    for i, item in enumerate(questions, start=1):
+        q_key = f"q{i}"
+        st.write(f"**{item['q']}**")
+        st.write(f"- {st.session_state.answers.get(q_key, '미선택')}")
+        st.write("")
