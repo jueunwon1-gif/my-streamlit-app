@@ -1,13 +1,29 @@
 import streamlit as st
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
+# (선택) TMDB 파이썬 래퍼: tmdbsimple
+# - Wrappers & Libraries 문서에 Python 래퍼로 소개됨 (tmdbsimple 등) :contentReference[oaicite:5]{index=5}
+try:
+    import tmdbsimple as tmdb  # pip install tmdbsimple
+    TMDBSIMPLE_AVAILABLE = True
+except Exception:
+    TMDBSIMPLE_AVAILABLE = False
+
+
+# =========================
+# 페이지 설정
+# =========================
 st.set_page_config(page_title="🎬 나와 어울리는 영화는?", page_icon="🎬", layout="wide")
 
-# =========================
-# TMDB 설정 / 상수
-# =========================
-POSTER_BASE = "https://image.tmdb.org/t/p/w500"
+st.title("🎬 나와 어울리는 영화는?")
+st.write("5개의 질문에 답하면, 당신의 취향을 분석해 **TMDB 인기 영화 5개**를 추천해드려요! 🍿")
+st.caption("※ TMDB API Key는 사이드바에 입력하세요.")
 
+# =========================
+# 장르 ID (요구사항)
+# =========================
 GENRES = {
     "액션": 28,
     "코미디": 35,
@@ -17,16 +33,13 @@ GENRES = {
     "판타지": 14,
 }
 
-# 선택지 인덱스 → 장르 성향 매핑
-CHOICE_GENRE_MAP = {
-    0: ["로맨스", "드라마"],  # ❤️
-    1: ["액션"],             # 🔥
-    2: ["SF", "판타지"],      # 🌌
-    3: ["코미디"],            # 😂
-}
-
 # =========================
-# 질문 데이터
+# 질문 (이전 대화에서 만든 질문)
+# 각 질문의 4개 선택지는 각각:
+# - 로맨스/드라마
+# - 액션/어드벤처
+# - SF/판타지
+# - 코미디
 # =========================
 questions = [
     {
@@ -76,172 +89,64 @@ questions = [
     },
 ]
 
-# =========================
-# 세션 상태 초기화
-# =========================
-if "answers" not in st.session_state:
-    st.session_state.answers = {}
-
-if "submitted" not in st.session_state:
-    st.session_state.submitted = False
-
-if "movies" not in st.session_state:
-    st.session_state.movies = []
-
-if "result_genre" not in st.session_state:
-    st.session_state.result_genre = None
-
-if "scores" not in st.session_state:
-    st.session_state.scores = {}
-
+# 선택지 인덱스 -> 장르 점수 매핑(고도화: 묶인 장르에 가중치 분배)
+# 0: 로맨스/드라마, 1: 액션, 2: SF/판타지, 3: 코미디
+CHOICE_SCORE = {
+    0: {"로맨스": 1, "드라마": 1},
+    1: {"액션": 2},
+    2: {"SF": 1, "판타지": 1},
+    3: {"코미디": 2},
+}
 
 # =========================
-# 초기화 함수
+# HTTP 세션 (리트라이 포함)
 # =========================
-def reset_test():
-    st.session_state.answers = {}
-    st.session_state.submitted = False
-    st.session_state.movies = []
-    st.session_state.result_genre = None
-    st.session_state.scores = {}
-
-    for i in range(1, 6):
-        key = f"q{i}"
-        if key in st.session_state:
-            del st.session_state[key]
-
-
-# =========================
-# 답변 분석 함수
-# =========================
-def analyze_answers():
-    scores = {g: 0 for g in GENRES.keys()}
-
-    for i, q in enumerate(questions, start=1):
-        q_key = f"q{i}"
-        selected = st.session_state.answers.get(q_key)
-
-        if selected:
-            idx = q["options"].index(selected)
-            mapped_genres = CHOICE_GENRE_MAP[idx]
-
-            for g in mapped_genres:
-                scores[g] += 1
-
-    best_genre = max(scores, key=scores.get)
-    return best_genre, scores
-
-
-# =========================
-# TMDB 영화 가져오기
-# =========================
-def fetch_movies(api_key, genre_id):
-    url = (
-        f"https://api.themoviedb.org/3/discover/movie"
-        f"?api_key={api_key}"
-        f"&with_genres={genre_id}"
-        f"&language=ko-KR"
-        f"&sort_by=popularity.desc"
+@st.cache_resource
+def get_http_session():
+    s = requests.Session()
+    retry = Retry(
+        total=3,
+        backoff_factor=0.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+        raise_on_status=False,
     )
-
-    response = requests.get(url)
-    data = response.json()
-
-    return data["results"][:5]
-
-
-# =========================
-# 추천 이유 생성
-# =========================
-def build_reason(genre):
-    return f"당신의 답변이 '{genre}' 성향과 가장 잘 맞아서 추천했어요!"
+    adapter = HTTPAdapter(max_retries=retry)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
 
 
 # =========================
-# UI 시작
+# TMDB configuration 가져오기(이미지 URL 견고화)
+# 이미지 URL은 base_url + size + file_path 조합이 원칙 :contentReference[oaicite:6]{index=6}
 # =========================
+@st.cache_data(ttl=60 * 60, show_spinner=False)
+def fetch_tmdb_configuration(api_key: str):
+    session = get_http_session()
+    url = "https://api.themoviedb.org/3/configuration"
+    r = session.get(url, params={"api_key": api_key}, timeout=15)
+    r.raise_for_status()
+    return r.json()
 
-# 사이드바
-with st.sidebar:
-    st.header("🔑 TMDB API Key 입력")
-    api_key = st.text_input("API Key", type="password")
 
-    st.button("다시 테스트하기", on_click=reset_test)
+def get_poster_base(api_key: str, preferred_size: str = "w500") -> str:
+    """
+    configuration에서 base_url + size를 구성.
+    실패하면 요구사항의 기본 URL로 fallback.
+    """
+    fallback = "https://image.tmdb.org/t/p/w500"
+    try:
+        config = fetch_tmdb_configuration(api_key)
+        images = config.get("images", {})
+        base_url = images.get("secure_base_url") or images.get("base_url")
+        sizes = images.get("poster_sizes", []) or []
+        if not base_url:
+            return fallback
 
-st.title("🎬 나와 어울리는 영화는?")
-st.write("질문에 답하면 TMDB에서 인기 영화 5개를 추천해드려요!")
-
-st.divider()
-
-# 질문 출력
-for i, q in enumerate(questions, start=1):
-    st.subheader(q["q"])
-
-    selected = st.radio(
-        label=f"q{i}",
-        options=q["options"],
-        key=f"q{i}",
-        label_visibility="collapsed"
-    )
-
-    st.session_state.answers[f"q{i}"] = selected
-
-st.divider()
-
-# 결과 보기 버튼
-if st.button("결과 보기", type="primary"):
-
-    if not api_key:
-        st.error("TMDB API Key를 입력해주세요!")
-    else:
-        st.session_state.submitted = True
-
-        # 1) 장르 분석
-        best_genre, scores = analyze_answers()
-        st.session_state.result_genre = best_genre
-        st.session_state.scores = scores
-
-        # 2) TMDB 영화 가져오기
-        with st.spinner("분석 중... 영화 추천 불러오는 중..."):
-            try:
-                genre_id = GENRES[best_genre]
-                movies = fetch_movies(api_key, genre_id)
-                st.session_state.movies = movies
-
-            except Exception as e:
-                st.error("TMDB 영화 데이터를 불러오지 못했습니다.")
-                st.write(e)
-
-# =========================
-# 결과 출력
-# =========================
-if st.session_state.submitted:
-
-    st.subheader("✅ 당신에게 어울리는 장르")
-    st.success(f"🎭 {st.session_state.result_genre}")
-
-    st.subheader("🎥 추천 영화 TOP 5")
-
-    for movie in st.session_state.movies:
-
-        title = movie.get("title")
-        rating = movie.get("vote_average")
-        overview = movie.get("overview")
-        poster_path = movie.get("poster_path")
-
-        poster_url = POSTER_BASE + poster_path if poster_path else None
-
-        col1, col2 = st.columns([1, 2])
-
-        with col1:
-            if poster_url:
-                st.image(poster_url, use_container_width=True)
-
-        with col2:
-            st.markdown(f"### 🎬 {title}")
-            st.write(f"⭐ 평점: {rating}")
-            st.write(f"📖 줄거리: {overview[:200]}...")
-
-            st.info("💡 추천 이유: " + build_reason(st.session_state.result_genre))
-
-        st.divider()
+        # preferred_size가 없으면 가장 가까운/무난한 크기 선택
+        if preferred_size in sizes:
+            size = preferred_size
+        else:
+            # w500이 없을 때를 대비해 중간값에 가까운 사이즈 선택
+            size = "w500" if "w500" in sizes else (
