@@ -32,6 +32,9 @@ demo_mode = st.sidebar.checkbox(
     help="API Key가 없어도 장르 분석 + 추천 3권 + 개인화 이유(설문 근거)를 확인할 수 있습니다.",
 )
 
+# =====================================================
+# App Header
+# =====================================================
 st.title("📚 나와 어울리는 책은?")
 st.write(
     "7문항 심리테스트로 **성향(장르 취향)**과 **현재 상황(무엇이 필요한지)**을 함께 파악해 "
@@ -41,7 +44,7 @@ st.write(
 )
 
 # =====================================================
-# New Questionnaire (성향 + 상황)
+# New Questionnaire (성향 + 상황) - 7개 유지
 #   - Q1~Q4: 성향 중심
 #   - Q5~Q7: 상황 중심
 # =====================================================
@@ -108,7 +111,7 @@ question_choices = [
 ]
 
 # =====================================================
-# Genre mapping (A~E)
+# Genre / Persona / "Book point" (⚠️ 에러 원인: genre_book_point가 누락되었음)
 # =====================================================
 genre_map = {"A": "자기계발", "B": "인문/철학", "C": "과학/IT", "D": "역사/사회", "E": "소설"}
 
@@ -120,13 +123,19 @@ genre_persona = {
     "소설": "감정·분위기·서사 몰입을 통해 회복하는 감성형",
 }
 
+# ✅ 누락되어 NameError가 났던 변수: 반드시 정의
+genre_book_point = {
+    "자기계발": "바로 적용 가능한 습관·실행 포인트",
+    "인문/철학": "감정과 생각을 정리해주는 통찰",
+    "과학/IT": "새로운 지식과 원리를 이해하는 재미",
+    "역사/사회": "세상 흐름을 읽고 관점을 넓히는 내용",
+    "소설": "감정적으로 몰입하며 위로와 여운을 주는 서사",
+}
+
+# =====================================================
 # 상황 태그(위로/휴식/동기/탐구) 점수화: Q5~Q7 기준
-# - 위로: 감정 위로/정서적 안정
-# - 휴식: 쉬고 싶음/회복
-# - 동기: 방향/동기부여/실행
-# - 탐구: 호기심/지식 탐색/세상 이해
+# =====================================================
 situation_tag_map_q5_to_q7 = {
-    # Q5
     5: {
         "A": ["동기"],
         "B": ["위로"],
@@ -134,7 +143,6 @@ situation_tag_map_q5_to_q7 = {
         "D": ["탐구"],
         "E": ["위로", "휴식"],
     },
-    # Q6
     6: {
         "A": ["동기"],
         "B": ["위로"],
@@ -142,7 +150,6 @@ situation_tag_map_q5_to_q7 = {
         "D": ["탐구"],
         "E": ["휴식", "위로"],
     },
-    # Q7
     7: {
         "A": ["동기"],
         "B": ["위로"],
@@ -236,10 +243,6 @@ def compute_genre_scores(answers):
 
 
 def compute_situation_scores(answers):
-    """
-    Q5~Q7만 상황 태그 점수화.
-    answers 인덱스: 0~6 (Q1~Q7)
-    """
     tags = {"위로": 0, "휴식": 0, "동기": 0, "탐구": 0}
     for qno in [5, 6, 7]:
         ans = answers[qno - 1]
@@ -257,7 +260,7 @@ def top_keys(scores: dict):
     ranked = get_ranked(scores)
     max_score = ranked[0][1]
     top = [k for k, v in ranked if v == max_score]
-    # second tier
+
     second_score = None
     for k, v in ranked:
         if v < max_score:
@@ -268,22 +271,16 @@ def top_keys(scores: dict):
 
 
 # =====================================================
-# Recommend 3 books: (demo) mix by top genre(s)
+# Recommend 3 books (demo)
 # =====================================================
 def pick_3_books(primary_genres, secondary_genres):
-    """
-    - 1등 동점(복합): 1등 장르들에서 섞어서 3권
-    - 단일 1등 + 2등 존재: 1등 2권 + 2등 1권
-    - 단일 1등: 3권
-    """
-    books = []
-
     if len(primary_genres) >= 2:
         pool = []
         for g in primary_genres:
             pool += [{"genre": g, **b} for b in fallback_pool[g]]
         random.shuffle(pool)
-        seen = set()
+
+        books, seen = [], set()
         for item in pool:
             if item["title"] in seen:
                 continue
@@ -321,11 +318,7 @@ def evidence_by_genre(answers, target_genre, max_evidence=2):
     return cleaned[:max_evidence]
 
 
-def evidence_by_situation(answers, top_situation_tags, max_evidence=2):
-    """
-    top_situation_tags: 예) ["휴식"] 또는 ["위로","휴식"]
-    Q5~Q7 답변에서 해당 상황 태그를 만들어낸 문항만 근거로 뽑음
-    """
+def evidence_by_situation(answers, top_situation_tags, max_evidence=1):
     evidences = []
     for qno in [5, 6, 7]:
         ans = answers[qno - 1]
@@ -334,25 +327,19 @@ def evidence_by_situation(answers, top_situation_tags, max_evidence=2):
         if any(t in top_situation_tags for t in tags):
             evidences.append(ans[3:].strip() if len(ans) > 3 else ans.strip())
 
-    # 중복/길이 방지
     random.shuffle(evidences)
     return evidences[:max_evidence]
 
 
 def build_reason(answers, book_title, book_genre, top_situation_tags):
-    """
-    - 장르 근거 1~2개 + 상황 근거 1개를 조합해 개인화 문장 생성
-    """
     genre_ev = evidence_by_genre(answers, book_genre, max_evidence=2)
     situa_ev = evidence_by_situation(answers, top_situation_tags, max_evidence=1)
 
     persona = genre_persona.get(book_genre, "")
     point = genre_book_point.get(book_genre, "")
-
     situa_phrase = ", ".join([tag_display.get(t, t) for t in top_situation_tags])
 
     parts = []
-
     if situa_ev:
         parts.append(f"당신은 최근 “{situa_ev[0]}”라고 답해 **{situa_phrase}**가 필요한 상태로 보여요.")
     else:
@@ -366,13 +353,12 @@ def build_reason(answers, book_title, book_genre, top_situation_tags):
     else:
         parts.append(f"{persona} 성향을 바탕으로 책을 골랐어요.")
 
-    parts.append(f"그래서 {point}를 주는 **{book_title}**을(를) 추천합니다.")
+    parts.append(f"그래서 {point}를 얻기 좋은 **{book_title}**을(를) 추천합니다.")
     return " ".join(parts)
 
 
 # =====================================================
-# OpenAI: optional book candidate generation
-#  - 이유는 우리가 (설문 근거 기반) 생성
+# OpenAI: optional book candidate generation (title/author/genre only)
 # =====================================================
 @st.cache_data(show_spinner=False)
 def call_openai_json(api_key: str, model: str, system: str, user: str) -> dict:
@@ -529,7 +515,7 @@ with c2:
     st.button("다시 테스트하기", on_click=reset_test)
 
 # =====================================================
-# Flow: analyze -> recommend -> (optionally) fetch real book info
+# Flow
 # =====================================================
 if clicked:
     answers = [st.session_state[f"q{i+1}"] for i in range(7)]
@@ -538,21 +524,19 @@ if clicked:
         st.warning(f"모든 질문에 답변해 주세요! (미응답: {', '.join(missing)}번)")
     else:
         with st.spinner("분석 중..."):
-            # 1) 성향(장르) 점수
+            # 1) 성향(장르)
             genre_scores = compute_genre_scores(answers)
             top_genres, second_genres, genre_ranked = top_keys(genre_scores)
 
-            # 2) 상황 태그 점수
+            # 2) 상황 태그
             situation_scores = compute_situation_scores(answers)
             top_situations, second_situations, situation_ranked = top_keys(situation_scores)
 
-            # focus genres for AI or mixing
             focus_genres = (top_genres[:2] if len(top_genres) >= 2 else top_genres + second_genres[:1]) or top_genres
 
-            # 3) 책 후보 3권 생성
+            # 3) 책 후보 3권
             if openai_api_key:
                 candidates = ai_pick_books(answers, focus_genres=focus_genres)
-                # 혹시 부족하면 데모로 보충
                 if len(candidates) < 3:
                     fill = pick_3_books(top_genres, second_genres)
                     for f in fill:
@@ -563,13 +547,13 @@ if clicked:
                 fill = pick_3_books(top_genres, second_genres)
                 candidates = [{"title": b["title"], "author": b.get("author", ""), "genre": b["genre"]} for b in fill]
 
-            # 4) 개인화 추천 이유(설문 근거 + 상황 태그 기반) 생성
+            # 4) 추천 이유 생성 (설문 근거 + 상황 기반)
             enriched = []
             for c in candidates[:3]:
                 why = build_reason(answers, c["title"], c["genre"], top_situations)
                 enriched.append({**c, "why": why})
 
-            # 5) 국립중앙도서관 API로 실제 도서 정보 조회(가능할 때만)
+            # 5) 국립중앙도서관 API로 실제 정보 (가능할 때)
             books_final = []
             can_fetch_nl = bool(nl_api_key)
 
@@ -583,13 +567,7 @@ if clicked:
 
                     if not item:
                         books_final.append(
-                            {
-                                **c,
-                                "isbn": "",
-                                "cover_url": "",
-                                "summary": "",
-                                "note": "국립중앙도서관에서 일치하는 도서를 찾지 못했어요.",
-                            }
+                            {**c, "isbn": "", "cover_url": "", "summary": "", "note": "국립중앙도서관에서 일치하는 도서를 찾지 못했어요."}
                         )
                         continue
 
@@ -617,12 +595,10 @@ if clicked:
                         }
                     )
             else:
-                # 데모 모드가 켜져 있으면 결과는 보여주되, 표지/소개는 비움
                 if demo_mode:
                     for c in enriched:
                         books_final.append({**c, "isbn": "", "cover_url": "", "summary": "", "note": ""})
                 else:
-                    # 데모 모드 OFF + 키 없음 => 결과를 만들지 않고 안내만
                     st.error("국립중앙도서관 API 키(cert_key)가 필요합니다. 사이드바에 입력해 주세요.")
                     st.stop()
 
@@ -630,40 +606,33 @@ if clicked:
             st.session_state.result = {
                 "genre_scores": genre_scores,
                 "genre_top": top_genres,
-                "genre_second": second_genres,
                 "genre_ranked": genre_ranked,
                 "situation_scores": situation_scores,
                 "situation_top": top_situations,
-                "situation_second": second_situations,
                 "situation_ranked": situation_ranked,
                 "focus_genres": focus_genres,
                 "used_openai": bool(openai_api_key),
                 "used_nl": can_fetch_nl,
                 "books": books_final,
-                "answers": answers,
             }
 
-
 # =====================================================
-# Render result
+# Render Result
 # =====================================================
 if st.session_state.submitted and st.session_state.result:
     r = st.session_state.result
 
     st.subheader("📌 분석 결과")
 
-    # 성향(장르)
     if len(r["genre_top"]) >= 2:
         st.success(f"당신의 **독서 성향(복합)**: {', '.join(r['genre_top'])}")
     else:
         st.success(f"당신의 **독서 성향**: {r['genre_top'][0]}")
 
-    # 상황(태그)
     top_sit = r["situation_top"]
     sit_text = ", ".join([tag_display.get(t, t) for t in top_sit])
     st.info(f"현재 당신에게 가장 필요한 것: **{sit_text}**")
 
-    # 점수 표시(간단)
     st.caption("장르 점수: " + ", ".join([f"{k} {v}" for k, v in r["genre_scores"].items()]))
     st.caption("상황 점수: " + ", ".join([f"{tag_display.get(k,k)} {v}" for k, v in r["situation_scores"].items()]))
 
