@@ -3,17 +3,10 @@ import streamlit as st
 st.set_page_config(page_title="나와 어울리는 책은?", page_icon="📚", layout="centered")
 
 st.title("📚 나와 어울리는 책은?")
-st.write("간단한 7문항 심리테스트로 당신의 독서 성향을 분석하고, 어울리는 책을 추천해드릴게요. "
-         "각 문항에서 가장 가까운 선택지를 골라주세요!")
-
-# 공통 선택지(항상 A~E가 같은 장르로 매핑되도록 유지)
-options = [
-    "A. 실용·성장 중심(자기계발)",
-    "B. 의미·통찰 중심(인문/철학)",
-    "C. 원리·정보 중심(과학/IT)",
-    "D. 맥락·구조 중심(역사/사회)",
-    "E. 이야기·몰입 중심(소설)",
-]
+st.write(
+    "간단한 7문항 심리테스트로 당신의 독서 성향을 분석하고, 어울리는 책을 추천해드릴게요. "
+    "각 문항에서 가장 가까운 선택지를 골라주세요!"
+)
 
 questions = [
     "1) 새로운 주제를 배울 때 내가 가장 흥미를 느끼는 방식은?",
@@ -25,7 +18,6 @@ questions = [
     "7) 내가 가장 궁금해하는 질문은 어떤 유형인가?",
 ]
 
-# 질문별 보기(각 질문은 실제 문장으로)
 question_choices = [
     [
         "A. 실생활에 적용할 수 있는 방법을 찾는다",
@@ -78,29 +70,68 @@ question_choices = [
     ],
 ]
 
+# ----------------------------
+# session_state 초기화
+# ----------------------------
+if "submitted" not in st.session_state:
+    st.session_state.submitted = False
+
+for i in range(7):
+    key = f"q{i+1}"
+    if key not in st.session_state:
+        st.session_state[key] = None
+
+
+def reset_test():
+    for i in range(7):
+        st.session_state[f"q{i+1}"] = None
+    st.session_state.submitted = False
+
+
 st.divider()
 st.subheader("📝 질문에 답해주세요")
 
-answers = []
+# ----------------------------
+# 질문 화면 (st.session_state에 저장)
+# ----------------------------
 for i, q in enumerate(questions):
     st.markdown(f"**{q}**")
-    ans = st.radio(
+    st.radio(
         label=f"q{i+1}",
         options=question_choices[i],
+        key=f"q{i+1}",
         index=None,  # 기본 선택 없음
-        label_visibility="collapsed"
+        label_visibility="collapsed",
     )
-    answers.append(ans)
-    st.write("")  # spacing
+    st.write("")
 
 st.divider()
 
-# 결과 보기 버튼
-clicked = st.button("결과 보기", type="primary")
+col1, col2 = st.columns(2)
 
-if clicked:
-    # 모두 응답했는지 확인
-    if any(a is None for a in answers):
-        st.warning("모든 질문에 답변해 주세요!")
-    else:
-        st.info("분석 중...")
+with col1:
+    if st.button("결과 보기", type="primary"):
+        # 미응답 체크
+        answers = [st.session_state[f"q{i+1}"] for i in range(7)]
+        if any(a is None for a in answers):
+            st.warning("모든 질문에 답변해 주세요!")
+            st.session_state.submitted = False
+        else:
+            st.session_state.submitted = True
+
+with col2:
+    st.button("다시 테스트하기", on_click=reset_test)
+
+# ----------------------------
+# 결과 영역
+# ----------------------------
+if st.session_state.submitted:
+    st.subheader("📌 응답 요약")
+    answers = [st.session_state[f"q{i+1}"] for i in range(7)]
+
+    # 질문-응답을 보기 좋게 표시
+    for i in range(7):
+        st.markdown(f"**{questions[i]}**")
+        st.write(answers[i])
+
+    st.info("분석 중...")
