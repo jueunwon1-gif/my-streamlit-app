@@ -22,6 +22,14 @@ nl_api_key = st.sidebar.text_input(
     type="password",
 )
 
+openai_api_key = st.sidebar.text_input(
+    "OpenAI API Key (선택)",
+    type="password",
+    help="입력하면 AI가 '한국어 책' 3권을 추천합니다. 없으면 데모 추천 목록으로 동작합니다.",
+)
+
+openai_model = st.sidebar.text_input("OpenAI 모델", value="gpt-4o-mini")
+
 demo_mode = st.sidebar.checkbox(
     "데모 모드(서지정보 실패해도 결과 보기)",
     value=True,
@@ -34,8 +42,8 @@ fetch_summary_default = st.sidebar.checkbox(
     help="OFF 권장: 기본은 표지/ISBN만 조회해서 빠르게 보여줍니다. 줄거리는 버튼으로 지연 로딩 가능.",
 )
 
-nl_timeout = st.sidebar.slider("API 타임아웃(초)", 5, 30, 10, 1)
-nl_retries = st.sidebar.slider("재시도 횟수", 0, 2, 1, 1)
+nl_timeout = st.sidebar.slider("국립중앙도서관 API 타임아웃(초)", 5, 30, 10, 1)
+nl_retries = st.sidebar.slider("국립중앙도서관 API 재시도 횟수", 0, 2, 1, 1)
 max_workers = st.sidebar.slider("동시 요청 수(병렬 처리)", 1, 6, 3, 1)
 
 # =====================================================
@@ -88,7 +96,6 @@ genre_book_point = {
     "소설": "감정적으로 몰입하며 위로와 여운을 주는 서사",
 }
 
-# 장르별 "미세 포커스 키워드" (책마다 다르게 강조)
 genre_flavors = {
     "자기계발": ["실행", "루틴", "동기부여", "습관", "자기관리"],
     "인문/철학": ["성찰", "관점", "자기이해", "가치", "질문"],
@@ -97,17 +104,15 @@ genre_flavors = {
     "소설": ["위로", "몰입", "여운", "관계", "회복"],
 }
 
-# 상황 태그 점수화(Q5~Q7)
 situation_tag_map_q5_to_q7 = {
     5: {"A": ["동기"], "B": ["위로"], "C": ["탐구"], "D": ["탐구"], "E": ["위로", "휴식"]},
     6: {"A": ["동기"], "B": ["위로"], "C": ["탐구"], "D": ["탐구"], "E": ["휴식", "위로"]},
     7: {"A": ["동기"], "B": ["위로"], "C": ["탐구"], "D": ["탐구"], "E": ["휴식", "위로"]},
 }
-
 tag_display = {"동기": "방향/동기부여", "위로": "감정 정리/위로", "휴식": "휴식/회복", "탐구": "호기심/탐구"}
 
 # =====================================================
-# Demo fallback pool
+# Demo fallback pool (한국어/번역서 혼합이지만 한국어로 유통되는 책들)
 # =====================================================
 fallback_pool = {
     "자기계발": [{"title": "아주 작은 습관의 힘", "author": "제임스 클리어"},{"title": "그릿", "author": "앤절라 더크워스"},{"title": "딥 워크", "author": "칼 뉴포트"},{"title": "원씽", "author": "게리 켈러"},{"title": "미라클 모닝", "author": "할 엘로드"}],
@@ -140,7 +145,7 @@ def reset_test():
     st.session_state.summary_loaded = False
 
 # =====================================================
-# Utility (scoring)
+# Scoring
 # =====================================================
 def letter_of(ans: str) -> str:
     return ans.strip()[0]
@@ -166,10 +171,12 @@ def top_keys(scores: Dict[str, int]):
     r = ranked(scores)
     maxv = r[0][1]
     top = [k for k, v in r if v == maxv]
-    return top, r
+    # second tier for fallback mixing
+    second = [k for k, v in r if v == (r[1][1] if len(r) > 1 else -1)]
+    return top, second, r
 
-def pick_3_books(top_genres: List[str]):
-    # 복합 성향이면 섞고, 아니면 한 장르 3권
+def pick_3_books(top_genres: List[str], second_genres: List[str]):
+    # 복합 성향이면 섞고, 아니면 1등 2권 + 2등 1권(있으면)
     if len(top_genres) >= 2:
         pool = []
         for g in top_genres[:2]:
@@ -184,17 +191,21 @@ def pick_3_books(top_genres: List[str]):
             if len(out) == 3:
                 break
         return out
-    g = top_genres[0]
-    return [{"genre": g, **b} for b in random.sample(fallback_pool[g], k=3)]
+
+    primary = top_genres[0]
+    out = [{"genre": primary, **b} for b in random.sample(fallback_pool[primary], k=2)]
+    if second_genres and second_genres[0] != primary:
+        out.append({"genre": second_genres[0], **random.choice(fallback_pool[second_genres[0]])})
+        random.shuffle(out)
+        return out[:3]
+    return [{"genre": primary, **b} for b in random.sample(fallback_pool[primary], k=3)]
 
 # =====================================================
 # Evidence + diversified reason generation
-#   ✅ 책마다 이유가 다르게 나오도록 "분산/템플릿/포커스" 적용
 # =====================================================
 def evidence_by_genre(answers: List[str], target_genre: str) -> List[str]:
     target_letter = next((l for l, g in genre_map.items() if g == target_genre), None)
-    matched = [a[3:].strip() for a in answers if target_letter and letter_of(a) == target_letter]
-    return matched  # 전체 후보를 반환(나중에 분산해서 씀)
+    return [a[3:].strip() for a in answers if target_letter and letter_of(a) == target_letter]
 
 def situation_evidence_candidates(answers: List[str], situation_tags: List[str]) -> List[str]:
     ev = []
@@ -204,22 +215,20 @@ def situation_evidence_candidates(answers: List[str], situation_tags: List[str])
         tags = situation_tag_map_q5_to_q7[qno].get(l, [])
         if any(t in situation_tags for t in tags):
             ev.append(ans[3:].strip())
-    return ev  # 전체 후보
+    return ev
 
 def rotate_pick(items: List[str], used: set, fallback: str = "") -> str:
     for it in items:
-        if it not in used:
+        if it and it not in used:
             used.add(it)
             return it
     return fallback if fallback else (items[0] if items else "")
 
 def pick_focus_tag(top_situations: List[str], idx: int) -> List[str]:
-    # 책 3권에 대해 상황 태그를 분산 강조
     if not top_situations:
         return []
     if len(top_situations) == 1:
         return top_situations
-    # 2개 이상이면 idx에 따라 하나씩 돌아가며 강조 (+ 3번째는 둘 다)
     if idx == 0:
         return [top_situations[0]]
     if idx == 1:
@@ -227,7 +236,6 @@ def pick_focus_tag(top_situations: List[str], idx: int) -> List[str]:
     return top_situations[:2]
 
 reason_templates = [
-    # (situation_first, genre_first) 느낌이 다르게
     "최근 “{s_ev}”라고 답한 걸 보면 지금은 **{sit}**이(가) 필요해 보여요. 그리고 “{g_ev}” 선택이 많아 {persona} 성향도 강하네요. 그래서 **{title}**을(를) 추천합니다. ({flavor} 포인트에 특히 잘 맞아요.)",
     "당신이 고른 답변 중 “{g_ev}”가 눈에 띄어요. {persona} 성향인 당신에게 **{sit}**을(를) 채워줄 책이 필요해서, {flavor}에 강한 **{title}**을(를) 골랐어요.",
     "지금은 **{sit}**을(를) 얻는 게 우선일 것 같아요(“{s_ev}”). 동시에 “{g_ev}”를 선택한 걸 보면 {persona}답게 읽을 만한 책이 필요하죠. 그래서 **{title}**을(를) 추천합니다.",
@@ -246,44 +254,96 @@ def build_reason_diversified(
     used_flavor: set,
     used_template: set,
 ) -> str:
-    # 1) 상황 포커스(책마다 다르게)
     focus_tags = pick_focus_tag(top_situations, idx)
     sit_label = ", ".join([tag_display.get(t, t) for t in focus_tags]) if focus_tags else "지금 필요한 것"
 
-    # 2) 근거 후보 수집
     g_candidates = evidence_by_genre(answers, genre)
     s_candidates = situation_evidence_candidates(answers, focus_tags) if focus_tags else []
 
-    g_ev = rotate_pick(g_candidates, used_genre_ev, fallback=(g_candidates[0] if g_candidates else ""))
-    s_ev = rotate_pick(s_candidates, used_sit_ev, fallback=(s_candidates[0] if s_candidates else ""))
+    g_ev = rotate_pick(g_candidates, used_genre_ev, fallback=(g_candidates[0] if g_candidates else "책에서 얻고 싶은 게 있다"))
+    s_ev = rotate_pick(s_candidates, used_sit_ev, fallback="요즘 책이 필요하다")
 
-    # 근거가 비면 최소 문장 유지
-    if not s_ev:
-        # Q5~Q7 중 아무거나라도 하나 가져와서 분위기 살리기
+    # 근거가 빈 경우 대비
+    if s_ev == "요즘 책이 필요하다":
         q5to7 = [answers[i][3:].strip() for i in [4, 5, 6] if answers[i]]
-        s_ev = rotate_pick(q5to7, used_sit_ev, fallback=(q5to7[0] if q5to7 else "요즘 책이 필요하다"))
-    if not g_ev:
-        # Q1~Q4 중 아무거나
+        if q5to7:
+            s_ev = rotate_pick(q5to7, used_sit_ev, fallback=q5to7[0])
+    if g_ev == "책에서 얻고 싶은 게 있다":
         q1to4 = [answers[i][3:].strip() for i in [0, 1, 2, 3] if answers[i]]
-        g_ev = rotate_pick(q1to4, used_genre_ev, fallback=(q1to4[0] if q1to4 else "책을 통해 얻고 싶은 게 있다"))
+        if q1to4:
+            g_ev = rotate_pick(q1to4, used_genre_ev, fallback=q1to4[0])
 
-    # 3) flavor 분산
     flavor_candidates = genre_flavors.get(genre, [])
-    flavor = rotate_pick(flavor_candidates, used_flavor, fallback=(flavor_candidates[0] if flavor_candidates else ""))
+    flavor = rotate_pick(flavor_candidates, used_flavor, fallback=(flavor_candidates[0] if flavor_candidates else "핵심"))
 
-    # 4) 템플릿 분산
     template = rotate_pick(reason_templates, used_template, fallback=reason_templates[idx % len(reason_templates)])
-
     persona = genre_persona.get(genre, "이런 성향")
 
-    return template.format(
-        s_ev=s_ev,
-        g_ev=g_ev,
-        sit=sit_label,
-        persona=persona,
-        title=title,
-        flavor=flavor,
+    return template.format(s_ev=s_ev, g_ev=g_ev, sit=sit_label, persona=persona, title=title, flavor=flavor)
+
+# =====================================================
+# OpenAI (한국어 책만 추천)
+# =====================================================
+@st.cache_data(show_spinner=False)
+def call_openai_json(api_key: str, model: str, system: str, user: str) -> dict:
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    payload = {
+        "model": model,
+        "temperature": 0.6,
+        "response_format": {"type": "json_object"},
+        "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+    }
+    r = requests.post(url, headers=headers, json=payload, timeout=30)
+    r.raise_for_status()
+    return json.loads(r.json()["choices"][0]["message"]["content"])
+
+def ai_pick_books_korean_only(answers: List[str], focus_genres: List[str], top_situations: List[str]) -> List[dict]:
+    system = (
+        "너는 한국의 독서 큐레이터다.\n"
+        "반드시 '한국어로 출간/유통되는 책(국내 도서 또는 한국어 번역서)'만 추천해라.\n"
+        "사용자의 설문(성향+상황)을 반영해 3권을 추천하되, 아래 JSON 형식만 출력해라.\n\n"
+        "{\n"
+        '  "recommendations": [\n'
+        '    {"title":"도서명", "author":"저자(모르면 빈 문자열)", "genre":"자기계발|인문/철학|과학/IT|역사/사회|소설"}\n'
+        "  ]\n"
+        "}\n\n"
+        "규칙:\n"
+        "- 반드시 실제로 존재하는 책\n"
+        "- genre는 지정된 5개 중 하나\n"
+        "- focus_genres를 우선 반영하되, 상황(top_situations)도 고려\n"
+        "- 대학생이 읽기 무난한 난이도 우선\n"
+        "- 시/만화/웹툰은 제외\n"
     )
+    user = (
+        f"focus_genres: {focus_genres}\n"
+        f"top_situations: {top_situations}\n"
+        "사용자 답변:\n" + "\n".join([f"- {a}" for a in answers])
+    )
+    obj = call_openai_json(openai_api_key, openai_model, system, user)
+    recs = obj.get("recommendations", [])
+
+    cleaned = []
+    for r in recs[:5]:  # 여유 있게 받고 3개로 자름
+        title = str(r.get("title", "")).strip()
+        author = str(r.get("author", "")).strip()
+        genre = str(r.get("genre", "")).strip()
+        if genre not in genre_map.values():
+            genre = focus_genres[0] if focus_genres else "소설"
+        if title:
+            cleaned.append({"title": title, "author": author, "genre": genre})
+
+    # 중복 제거
+    uniq = []
+    seen = set()
+    for c in cleaned:
+        if c["title"] in seen:
+            continue
+        seen.add(c["title"])
+        uniq.append(c)
+        if len(uniq) == 3:
+            break
+    return uniq
 
 # =====================================================
 # Networking (fast)
@@ -442,16 +502,35 @@ if clicked:
     else:
         with st.spinner("분석 중..."):
             genre_scores = compute_genre_scores(answers)
-            top_genres, _ = top_keys(genre_scores)
+            top_genres, second_genres, _ = top_keys(genre_scores)
 
             situation_scores = compute_situation_scores(answers)
-            top_situations, _ = top_keys(situation_scores)
+            top_situations, _, _ = top_keys(situation_scores)
 
-            candidates = pick_3_books(top_genres)
+            # focus: 최대 2개 장르
+            focus_genres = top_genres[:2] if len(top_genres) >= 2 else (top_genres + second_genres[:1])
 
-            # ✅ 책마다 이유가 달라지도록 "used set"을 공유
+            # 1) AI 추천(가능하면)
+            candidates: List[dict] = []
+            used_ai = False
+            if openai_api_key:
+                try:
+                    ai_recs = ai_pick_books_korean_only(answers, focus_genres=focus_genres, top_situations=top_situations)
+                    if len(ai_recs) == 3:
+                        candidates = ai_recs
+                        used_ai = True
+                except Exception:
+                    candidates = []
+                    used_ai = False
+
+            # 2) 실패/미입력 시 fallback
+            if len(candidates) < 3:
+                fb = pick_3_books(top_genres, second_genres)
+                candidates = [{"title": b["title"], "author": b.get("author", ""), "genre": b["genre"]} for b in fb]
+                used_ai = False
+
+            # ✅ 책마다 이유가 다르게 생성
             used_genre_ev, used_sit_ev, used_flavor, used_template = set(), set(), set(), set()
-
             enriched = []
             for idx, c in enumerate(candidates[:3]):
                 why = build_reason_diversified(
@@ -469,12 +548,14 @@ if clicked:
 
             # ✅ 병렬로 3권 조회 (표지/ISBN 우선)
             books_final = []
+            used_nl = False
             if nl_api_key:
+                used_nl = True
                 with ThreadPoolExecutor(max_workers=max_workers) as ex:
                     futures = [ex.submit(fetch_one_book_nl, c) for c in enriched]
                     for f in as_completed(futures):
                         books_final.append(f.result())
-                # 추천 순서 유지(원래 리스트 기준)
+                # 추천 순서 유지(원래 리스트 기준) - title 기반으로 정렬
                 order = {b["title"]: i for i, b in enumerate(enriched)}
                 books_final.sort(key=lambda x: order.get(x["title"], 999))
             else:
@@ -488,6 +569,8 @@ if clicked:
                 "situation_top": top_situations,
                 "books": books_final,
                 "answers": answers,
+                "used_ai": used_ai,
+                "used_nl": used_nl,
             }
 
 # =====================================================
@@ -501,7 +584,12 @@ if st.session_state.submitted and st.session_state.result:
     sit_text = ", ".join([tag_display.get(t, t) for t in r["situation_top"]])
     st.info(f"현재 필요한 것: **{sit_text}**")
 
-    if nl_api_key:
+    if r.get("used_ai"):
+        st.caption("✅ OpenAI를 사용해 '한국어로 출간/유통되는 책' 3권을 추천했습니다.")
+    else:
+        st.caption("ℹ️ OpenAI 미사용/실패로 데모 추천 목록을 사용했습니다.")
+
+    if r.get("used_nl"):
         st.caption("※ 속도 개선: 기본은 표지/ISBN만 조회합니다. 줄거리는 ‘줄거리 불러오기’ 버튼으로 지연 로딩하세요.")
     else:
         st.warning("국립중앙도서관 API 키가 없어서 표지/ISBN/줄거리는 표시되지 않습니다.")
