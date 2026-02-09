@@ -1,14 +1,9 @@
 import json
 import random
-import re
-import time
-from html import unescape
 from typing import Dict, List
 
 import requests
 import streamlit as st
-from requests.exceptions import ReadTimeout, ConnectionError, HTTPError, RequestException
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 st.set_page_config(page_title="나와 어울리는 책은?", page_icon="📚", layout="centered")
 
@@ -50,8 +45,6 @@ st.markdown(
       }
       .why-label { font-weight: 700; margin-bottom: 6px; }
       .divider-soft { height: 1px; background: rgba(0,0,0,.06); margin: 14px 0; }
-      /* expander header */
-      .stExpander summary { font-weight: 700; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -62,34 +55,13 @@ st.markdown(
 # =====================================================
 st.sidebar.header("🔑 API 설정")
 
-nl_api_key = st.sidebar.text_input(
-    "국립중앙도서관(ISBN 서지정보) API Key (cert_key)",
-    type="password",
-)
-
 openai_api_key = st.sidebar.text_input(
     "OpenAI API Key (선택)",
     type="password",
-    help="입력하면 AI가 '한국어 책' 3권을 추천합니다. 없으면 데모 추천 목록으로 동작합니다.",
+    help="입력하면 AI가 '한국어로 출간/유통되는 책' 3권을 추천합니다. 없으면 데모 추천 목록으로 동작합니다.",
 )
 
 openai_model = st.sidebar.text_input("OpenAI 모델", value="gpt-4o-mini")
-
-demo_mode = st.sidebar.checkbox(
-    "데모 모드(서지정보 실패해도 결과 보기)",
-    value=True,
-)
-
-st.sidebar.subheader("⚡ 속도 옵션(추천)")
-fetch_summary_default = st.sidebar.checkbox(
-    "줄거리/책소개도 바로 가져오기(느림)",
-    value=False,
-    help="OFF 권장: 기본은 표지/ISBN만 조회해서 빠르게 보여줍니다. 줄거리는 버튼으로 지연 로딩 가능.",
-)
-
-nl_timeout = st.sidebar.slider("국립중앙도서관 API 타임아웃(초)", 5, 30, 10, 1)
-nl_retries = st.sidebar.slider("국립중앙도서관 API 재시도 횟수", 0, 2, 1, 1)
-max_workers = st.sidebar.slider("동시 요청 수(병렬 처리)", 1, 6, 3, 1)
 
 # =====================================================
 # Header
@@ -166,8 +138,6 @@ if "submitted" not in st.session_state:
     st.session_state.submitted = False
 if "result" not in st.session_state:
     st.session_state.result = None
-if "summary_loaded" not in st.session_state:
-    st.session_state.summary_loaded = False
 
 for i in range(7):
     k = f"q{i+1}"
@@ -179,7 +149,6 @@ def reset_test():
         st.session_state[f"q{i+1}"] = None
     st.session_state.submitted = False
     st.session_state.result = None
-    st.session_state.summary_loaded = False
 
 # =====================================================
 # Scoring
@@ -316,7 +285,7 @@ def build_reason_diversified(
     return template.format(s_ev=s_ev, g_ev=g_ev, sit=sit_label, persona=persona, title=title, flavor=flavor)
 
 # =====================================================
-# OpenAI (한국어 책만 추천)
+# OpenAI (선택)
 # =====================================================
 @st.cache_data(show_spinner=False)
 def call_openai_json(api_key: str, model: str, system: str, user: str) -> dict:
@@ -354,7 +323,7 @@ def ai_pick_books_korean_only(answers: List[str], focus_genres: List[str], top_s
         f"top_situations: {top_situations}\n"
         "사용자 답변:\n" + "\n".join([f"- {a}" for a in answers])
     )
-    obj = call_openai_json(openai_api_key, openai_model, system, user)
+    obj = call_openai_json(api_key=openai_api_key, model=openai_model, system=system, user=user)
     recs = obj.get("recommendations", [])
 
     cleaned = []
@@ -378,123 +347,6 @@ def ai_pick_books_korean_only(answers: List[str], focus_genres: List[str], top_s
     return uniq
 
 # =====================================================
-# Networking
-# =====================================================
-def requests_get(url, params=None, timeout=10, retries=1):
-    last = None
-    for i in range(retries + 1):
-        try:
-            return requests.get(url, params=params, timeout=timeout)
-        except (ReadTimeout, ConnectionError) as e:
-            last = e
-            if i == retries:
-                raise
-            time.sleep(0.4 * (2**i))
-    raise last
-
-@st.cache_data(show_spinner=False)
-def nl_isbn_search(cert_key: str, title: str, author: str = "", page_size: int = 5, timeout: int = 10, retries: int = 1):
-    url = "https://www.nl.go.kr/seoji/SearchApi.do"
-    params = {"cert_key": cert_key, "result_style": "json", "page_no": 1, "page_size": page_size, "title": title}
-    if author:
-        params["author"] = author
-    r = requests_get(url, params=params, timeout=timeout, retries=retries)
-    r.raise_for_status()
-    try:
-        return r.json()
-    except Exception:
-        return json.loads(r.text)
-
-def pick_best_item(nl_json, wanted_title: str):
-    items = None
-    if isinstance(nl_json, dict):
-        for k in ["docs", "data", "items", "result"]:
-            if k in nl_json and isinstance(nl_json[k], list):
-                items = nl_json[k]
-                break
-        if items is None:
-            for v in nl_json.values():
-                if isinstance(v, list) and v and isinstance(v[0], dict):
-                    items = v
-                    break
-    if not items:
-        return None
-
-    wt = wanted_title.replace(" ", "").lower()
-
-    def score(it):
-        t = str(it.get("TITLE", "") or it.get("title", "")).replace(" ", "").lower()
-        if not t:
-            return 0
-        if t == wt:
-            return 100
-        if wt in t or t in wt:
-            return 60
-        return 1
-
-    return sorted(items, key=score, reverse=True)[0]
-
-@st.cache_data(show_spinner=False)
-def fetch_text_from_url(url: str, max_chars: int = 650, timeout: int = 10, retries: int = 0) -> str:
-    if not url:
-        return ""
-    try:
-        r = requests_get(url, params=None, timeout=timeout, retries=retries)
-        r.raise_for_status()
-        text = r.text
-        text = re.sub(r"<script.*?>.*?</script>", " ", text, flags=re.DOTALL | re.IGNORECASE)
-        text = re.sub(r"<style.*?>.*?</style>", " ", text, flags=re.DOTALL | re.IGNORECASE)
-        text = re.sub(r"<[^>]+>", " ", text)
-        text = unescape(text)
-        text = re.sub(r"\s+", " ", text).strip()
-        return (text[:max_chars].rstrip() + "…") if len(text) > max_chars else text
-    except RequestException:
-        return ""
-
-def fetch_one_book_nl(c: dict) -> dict:
-    # 실패/없음 안내문구는 UI에 띄우지 않도록 값은 그냥 빈칸으로 둠
-    if not nl_api_key:
-        return {**c, "isbn": "", "cover_url": "", "summary": "", "note": ""}
-
-    try:
-        nl_json = nl_isbn_search(
-            nl_api_key,
-            title=c["title"],
-            author=c.get("author", ""),
-            page_size=5,
-            timeout=nl_timeout,
-            retries=nl_retries,
-        )
-        item = pick_best_item(nl_json, c["title"])
-        if not item:
-            return {**c, "isbn": "", "cover_url": "", "summary": "", "note": ""}
-
-        isbn = item.get("EA_ISBN") or item.get("ISBN") or item.get("isbn") or ""
-        cover_url = item.get("TITLE_URL") or item.get("cover") or item.get("image") or ""
-
-        summary = ""
-        if fetch_summary_default or st.session_state.summary_loaded:
-            intro_url = item.get("BOOK_INTRODUCTION_URL") or ""
-            summary_url = item.get("BOOK_SUMMARY_URL") or ""
-            summary = fetch_text_from_url(summary_url, timeout=nl_timeout, retries=0)
-            if not summary:
-                summary = fetch_text_from_url(intro_url, timeout=nl_timeout, retries=0)
-
-        return {
-            **c,
-            "title": (item.get("TITLE") or c["title"]).strip(),
-            "author": (item.get("AUTHOR") or c.get("author", "")).strip(),
-            "isbn": str(isbn).strip(),
-            "cover_url": str(cover_url).strip(),
-            "summary": summary.strip(),
-            "note": "",
-        }
-
-    except (ReadTimeout, ConnectionError, HTTPError, RequestException):
-        # demo_mode 여부와 관계없이 UI가 깔끔하게 보이도록 빈 값 반환
-        return {**c, "isbn": "", "cover_url": "", "summary": "", "note": ""}
-
-# =====================================================
 # UI: Questionnaire
 # =====================================================
 st.divider()
@@ -512,16 +364,11 @@ for i, q in enumerate(questions):
     st.write("")
 
 st.divider()
-c1, c2, c3 = st.columns([1, 1, 1.4])
+c1, c2 = st.columns([1, 1])
 with c1:
     clicked = st.button("결과 보기", type="primary")
 with c2:
     st.button("다시 테스트하기", on_click=reset_test)
-with c3:
-    load_summary_clicked = st.button("줄거리 불러오기(느림)", help="결과가 나온 뒤 눌러주세요. (지연 로딩)")
-
-if load_summary_clicked:
-    st.session_state.summary_loaded = True
 
 # =====================================================
 # Flow
@@ -543,10 +390,11 @@ if clicked:
 
             candidates: List[dict] = []
             used_ai = False
+
             if openai_api_key:
                 try:
                     ai_recs = ai_pick_books_korean_only(
-                        answers,
+                        answers=answers,
                         focus_genres=focus_genres,
                         top_situations=top_situations
                     )
@@ -563,7 +411,7 @@ if clicked:
                 used_ai = False
 
             used_genre_ev, used_sit_ev, used_flavor, used_template = set(), set(), set(), set()
-            enriched = []
+            books_final = []
             for idx, c in enumerate(candidates[:3]):
                 why = build_reason_diversified(
                     answers=answers,
@@ -576,20 +424,7 @@ if clicked:
                     used_flavor=used_flavor,
                     used_template=used_template,
                 )
-                enriched.append({**c, "why": why})
-
-            books_final = []
-            used_nl = False
-            if nl_api_key:
-                used_nl = True
-                with ThreadPoolExecutor(max_workers=max_workers) as ex:
-                    futures = [ex.submit(fetch_one_book_nl, c) for c in enriched]
-                    for f in as_completed(futures):
-                        books_final.append(f.result())
-                order = {b["title"]: i for i, b in enumerate(enriched)}
-                books_final.sort(key=lambda x: order.get(x["title"], 999))
-            else:
-                books_final = [{**c, "isbn": "", "cover_url": "", "summary": "", "note": ""} for c in enriched]
+                books_final.append({**c, "why": why})
 
             st.session_state.submitted = True
             st.session_state.result = {
@@ -600,11 +435,10 @@ if clicked:
                 "books": books_final,
                 "answers": answers,
                 "used_ai": used_ai,
-                "used_nl": used_nl,
             }
 
 # =====================================================
-# Render (예쁜 카드 UI 버전)
+# Render (예쁜 카드 UI)
 # =====================================================
 if st.session_state.submitted and st.session_state.result:
     r = st.session_state.result
@@ -614,7 +448,6 @@ if st.session_state.submitted and st.session_state.result:
     sit_text = ", ".join([tag_display.get(t, t) for t in r["situation_top"]])
     genre_text = ", ".join(r["genre_top"])
 
-    # 상단 요약 카드
     st.markdown(
         f"""
         <div class="result-card">
@@ -629,7 +462,6 @@ if st.session_state.submitted and st.session_state.result:
           <div class="divider-soft"></div>
           <div class="small-muted">
             {("✅ OpenAI 기반 추천" if r.get("used_ai") else "ℹ️ 데모 추천 목록 기반")}
-            {(" · 서지정보(표지/ISBN) 연동" if r.get("used_nl") else "")}
           </div>
         </div>
         """,
@@ -641,16 +473,11 @@ if st.session_state.submitted and st.session_state.result:
     for idx, b in enumerate(r["books"], start=1):
         title = b.get("title", "").strip()
         author = b.get("author", "").strip()
-        isbn = b.get("isbn", "").strip()
-        cover = b.get("cover_url", "").strip()
         why = b.get("why", "").strip()
-        summary = b.get("summary", "").strip()
         genre = b.get("genre", "").strip()
 
-        # 각 책 카드
         st.markdown('<div class="result-card">', unsafe_allow_html=True)
 
-        # 상단 타이틀 + 태그
         st.markdown(
             f"""
             <div class="title-row">
@@ -660,36 +487,20 @@ if st.session_state.submitted and st.session_state.result:
             <div class="book-title">{title}</div>
             <div class="book-meta">
               {("저자: " + author) if author else ""}
-              {(" · " if author and isbn else "")}
-              {("ISBN: " + isbn) if isbn else ""}
             </div>
             """,
             unsafe_allow_html=True
         )
 
-        col1, col2 = st.columns([1.05, 1.95], gap="large")
-
-        # 표지: 있을 때만
-        with col1:
-            if cover:
-                st.image(cover, use_container_width=True)
-
-        # 내용
-        with col2:
-            if why:
-                st.markdown(
-                    f"""
-                    <div class="why-box">
-                      <div class="why-label">✨ 추천 이유</div>
-                      <div>{why}</div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True
-                )
-
-            # 줄거리: 있을 때만 expander
-            if summary:
-                with st.expander("📖 줄거리/책소개 보기"):
-                    st.write(summary)
+        if why:
+            st.markdown(
+                f"""
+                <div class="why-box">
+                  <div class="why-label">✨ 추천 이유</div>
+                  <div>{why}</div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
 
         st.markdown("</div>", unsafe_allow_html=True)
