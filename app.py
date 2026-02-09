@@ -2,8 +2,10 @@ import json
 import random
 import re
 import time
+import traceback
 from html import unescape
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
+from urllib.parse import urlencode
 
 import requests
 import streamlit as st
@@ -13,6 +15,28 @@ from requests.exceptions import ReadTimeout, ConnectionError, HTTPError, Request
 # Streamlit Setup
 # =====================================================
 st.set_page_config(page_title="나와 어울리는 책은?", page_icon="📚", layout="centered")
+
+# =====================================================
+# Debug helpers
+# =====================================================
+def _ensure_debug_state():
+    if "_debug_logs" not in st.session_state:
+        st.session_state._debug_logs = []
+    if "_debug_last_nl" not in st.session_state:
+        st.session_state._debug_last_nl = None
+
+def debug_log(event: str, **data):
+    _ensure_debug_state()
+    st.session_state._debug_logs.append({
+        "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "event": event,
+        "data": data
+    })
+
+def debug_clear():
+    _ensure_debug_state()
+    st.session_state._debug_logs = []
+    st.session_state._debug_last_nl = None
 
 # =====================================================
 # Sidebar
@@ -42,7 +66,19 @@ fetch_summary_default = st.sidebar.checkbox(
 )
 
 st.sidebar.subheader("🧪 디버그")
+debug_mode = st.sidebar.checkbox("디버그 모드 ON", value=False)
+debug_verbose = st.sidebar.checkbox("응답 일부(앞 800자)까지 기록", value=True)
 debug_show_raw = st.sidebar.checkbox("후보 1개 raw JSON 보기", value=False)
+debug_show_logs = st.sidebar.checkbox("디버그 로그 표시", value=True)
+
+col_dbg1, col_dbg2 = st.sidebar.columns(2)
+with col_dbg1:
+    if st.button("디버그 로그 초기화"):
+        debug_clear()
+with col_dbg2:
+    pass
+
+st.sidebar.caption("디버그 ON이면 캐시를 우회해 매 호출을 기록합니다(문제 재현/추적용).")
 
 # =====================================================
 # Header
@@ -135,6 +171,11 @@ def reset_test():
     st.session_state.submitted = False
     st.session_state.result = None
     st.session_state.summary_loaded = False
+    # 추천문구 다양화용 used set도 초기화
+    st.session_state.pop("_used_genre_ev", None)
+    st.session_state.pop("_used_sit_ev", None)
+    st.session_state.pop("_used_flavor", None)
+    st.session_state.pop("_used_tmpl", None)
 
 # =====================================================
 # Scoring
@@ -179,22 +220,40 @@ def top_list(scores: Dict[str, int]) -> List[str]:
     return [k for k, v in r if v == topv]
 
 # =====================================================
-# Networking
+# Networking (with debug)
 # =====================================================
-def requests_get(url, params=None, timeout=10, retries=1):
+def requests_get(url, params=None, timeout=10, retries=1, debug=False):
     last = None
     for i in range(retries + 1):
         try:
-            return requests.get(url, params=params, timeout=timeout)
+            if debug:
+                debug_log("http_request", method="GET", url=url, params=params, timeout=timeout, attempt=i, retries=retries)
+            r = requests.get(url, params=params, timeout=timeout)
+            if debug:
+                debug_log("http_response_meta",
+                          status_code=r.status_code,
+                          content_type=r.headers.get("Content-Type", ""),
+                          final_url=r.url)
+                if debug_verbose:
+                    debug_log("http_response_head", head=r.text[:800])
+            return r
         except (ReadTimeout, ConnectionError) as e:
             last = e
+            if debug:
+                debug_log("http_exception_retryable", error=str(e), type=type(e).__name__, attempt=i, retries=retries,
+                          traceback=traceback.format_exc())
             if i == retries:
                 raise
             time.sleep(0.4 * (2**i))
+        except Exception as e:
+            if debug:
+                debug_log("http_exception_fatal", error=str(e), type=type(e).__name__, traceback=traceback.format_exc())
+            raise
     raise last
 
 @st.cache_data(show_spinner=False)
-def nl_search_raw(cert_key: str, title_query: str, page_no: int, page_size: int, timeout: int, retries: int) -> dict:
+def nl_search_raw_cached(cert_key: str, title_query: str, page_no: int, page_size: int, timeout: int, retries: int, cache_buster: str) -> dict:
+    # cache_buster는 디버그 모드에서 캐시 우회용(값이 바뀌면 캐시 키가 바뀜)
     url = "https://www.nl.go.kr/seoji/SearchApi.do"
     params = {
         "cert_key": cert_key,
@@ -203,22 +262,78 @@ def nl_search_raw(cert_key: str, title_query: str, page_no: int, page_size: int,
         "page_size": page_size,
         "title": title_query,
     }
-    r = requests_get(url, params=params, timeout=timeout, retries=retries)
+    r = requests_get(url, params=params, timeout=timeout, retries=retries, debug=False)
     r.raise_for_status()
     try:
         return r.json()
     except Exception:
         return json.loads(r.text)
 
+def nl_search_raw(cert_key: str, title_query: str, page_no: int, page_size: int, timeout: int, retries: int, debug: bool) -> dict:
+    """
+    debug=False: 캐시 사용 (빠름)
+    debug=True : 캐시 우회 + 상세 로그 기록 (추적용)
+    """
+    url = "https://www.nl.go.kr/seoji/SearchApi.do"
+    params = {
+        "cert_key": cert_key,
+        "result_style": "json",
+        "page_no": page_no,
+        "page_size": page_size,
+        "title": title_query,
+    }
+
+    if not debug:
+        # 캐시 사용
+        return nl_search_raw_cached(cert_key, title_query, page_no, page_size, timeout, retries, cache_buster="")
+
+    # 디버그: 캐시 우회 + 로그
+    try:
+        debug_log("nl_request_prepared", base_url=url, query=urlencode(params, doseq=True))
+        r = requests_get(url, params=params, timeout=timeout, retries=retries, debug=True)
+        # 상태코드가 200이 아니면 여기서 raise
+        r.raise_for_status()
+        st.session_state._debug_last_nl = {
+            "status_code": r.status_code,
+            "content_type": r.headers.get("Content-Type", ""),
+            "final_url": r.url,
+        }
+        try:
+            data = r.json()
+        except Exception:
+            debug_log("nl_json_parse_failed", note="response not json -> fallback json.loads(text)", traceback=traceback.format_exc())
+            data = json.loads(r.text)
+
+        debug_log("nl_response_parsed", top_keys=list(data.keys()) if isinstance(data, dict) else str(type(data)))
+        return data
+    except Exception as e:
+        debug_log("nl_search_raw_exception", error=str(e), type=type(e).__name__, traceback=traceback.format_exc())
+        raise
+
 def _extract_items(nl_json: dict) -> List[dict]:
+    """
+    응답 포맷이 바뀌거나 중첩되는 경우가 있어 최대한 관대하게 추출.
+    """
     if not isinstance(nl_json, dict):
         return []
-    for k in ["docs", "data", "items", "result"]:
+
+    # 1) 흔한 키들
+    for k in ["docs", "data", "items", "result", "DOCS", "ITEMS"]:
         if k in nl_json and isinstance(nl_json[k], list):
             return nl_json[k]
+
+    # 2) 중첩 (예: { "SEARH": { "docs": [...] } } 같은 케이스)
+    for v in nl_json.values():
+        if isinstance(v, dict):
+            for k in ["docs", "data", "items", "result"]:
+                if k in v and isinstance(v[k], list):
+                    return v[k]
+
+    # 3) 최후: dict 내부 어딘가 list[dict] 탐색
     for v in nl_json.values():
         if isinstance(v, list) and v and isinstance(v[0], dict):
             return v
+
     return []
 
 def _normalize_item(it: dict) -> dict:
@@ -227,11 +342,11 @@ def _normalize_item(it: dict) -> dict:
     publisher = (it.get("PUBLISHER") or it.get("publisher") or "").strip()
     isbn = (it.get("EA_ISBN") or it.get("ISBN") or it.get("isbn") or "").strip()
     cover_url = (it.get("TITLE_URL") or it.get("cover") or it.get("image") or "").strip()
-    intro_url = (it.get("BOOK_INTRODUCTION_URL") or "").strip()
-    summary_url = (it.get("BOOK_SUMMARY_URL") or "").strip()
-    pub_year = (it.get("PUBLISH_PREDATE") or it.get("PUBLISH_DATE") or "").strip()
+    intro_url = (it.get("BOOK_INTRODUCTION_URL") or it.get("intro_url") or "").strip()
+    summary_url = (it.get("BOOK_SUMMARY_URL") or it.get("summary_url") or "").strip()
+    pub_year = (it.get("PUBLISH_PREDATE") or it.get("PUBLISH_DATE") or it.get("publish_date") or "").strip()
     pub_year = pub_year[:4] if pub_year else ""
-    kdc_name = (it.get("KDC_NAME") or "").strip()
+    kdc_name = (it.get("KDC_NAME") or it.get("kdc_name") or "").strip()
     return {
         "title": title,
         "author": author,
@@ -249,7 +364,7 @@ def _dedup_items(items: List[dict]) -> List[dict]:
     seen = set()
     out = []
     for it in items:
-        key = it.get("isbn") or (it.get("title","") + "|" + it.get("author",""))
+        key = it.get("isbn") or (it.get("title", "") + "|" + it.get("author", ""))
         key = key.strip()
         if not key or key in seen:
             continue
@@ -280,24 +395,44 @@ def build_nl_queries(focus_genres: List[str], top_situations: List[str]) -> List
             uniq.append(q)
     return uniq[:3]
 
-def fetch_candidate_pool_from_nl(cert_key: str, focus_genres: List[str], top_situations: List[str], target_pool_size: int, timeout: int, retries: int):
+def fetch_candidate_pool_from_nl(cert_key: str, focus_genres: List[str], top_situations: List[str],
+                                 target_pool_size: int, timeout: int, retries: int, debug: bool):
     used_queries = build_nl_queries(focus_genres, top_situations)
     all_items: List[dict] = []
     per_query_page_size = max(10, min(50, target_pool_size // max(1, len(used_queries))))
     per_query_page_size = min(per_query_page_size, 50)
 
+    if debug:
+        debug_log("pool_fetch_start", used_queries=used_queries, per_query_page_size=per_query_page_size,
+                  target_pool_size=target_pool_size, timeout=timeout, retries=retries)
+
+    errors = []
+
     for q in used_queries:
         try:
-            raw = nl_search_raw(cert_key, title_query=q, page_no=1, page_size=per_query_page_size, timeout=timeout, retries=retries)
-            items = [_normalize_item(it) for it in _extract_items(raw)]
+            raw = nl_search_raw(cert_key, title_query=q, page_no=1, page_size=per_query_page_size,
+                                timeout=timeout, retries=retries, debug=debug)
+            items_raw = _extract_items(raw)
+            if debug:
+                debug_log("pool_query_extract", query=q, extracted_count=len(items_raw),
+                          sample_keys=(list(items_raw[0].keys()) if items_raw and isinstance(items_raw[0], dict) else None))
+
+            items = [_normalize_item(it) for it in items_raw if isinstance(it, dict)]
             all_items.extend(items)
-        except Exception:
+        except Exception as e:
+            errors.append({"query": q, "error": str(e), "type": type(e).__name__})
+            if debug:
+                debug_log("pool_query_failed", query=q, error=str(e), type=type(e).__name__, traceback=traceback.format_exc())
             continue
 
     all_items = _dedup_items(all_items)
+
+    if debug:
+        debug_log("pool_fetch_done", total_items=len(all_items), errors=errors)
+
     if len(all_items) > target_pool_size:
         all_items = all_items[:target_pool_size]
-    return all_items, used_queries
+    return all_items, used_queries, errors
 
 # =====================================================
 # Lazy summary
@@ -307,7 +442,7 @@ def fetch_text_from_url(url: str, max_chars: int = 700, timeout: int = 10, retri
     if not url:
         return ""
     try:
-        r = requests_get(url, params=None, timeout=timeout, retries=retries)
+        r = requests.get(url, timeout=timeout)
         r.raise_for_status()
         text = r.text
         text = re.sub(r"<script.*?>.*?</script>", " ", text, flags=re.DOTALL | re.IGNORECASE)
@@ -344,7 +479,7 @@ def call_openai_json(api_key: str, model: str, system: str, user: str) -> dict:
     r.raise_for_status()
     return json.loads(r.json()["choices"][0]["message"]["content"])
 
-def ai_choose_from_pool(answers: List[str], focus_genres: List[str], top_situations: List[str], pool: List[dict]) -> List[dict]:
+def ai_choose_from_pool(answers: List[str], focus_genres: List[str], top_situations: List[str], pool: List[dict], openai_api_key: str, openai_model: str) -> List[dict]:
     pool_trim = pool[:40]
     brief = []
     for i, b in enumerate(pool_trim):
@@ -446,7 +581,6 @@ def build_reason(answers: List[str], primary_genre: str, top_situations: List[st
     used_flavor = st.session_state.setdefault("_used_flavor", set())
     used_tmpl = st.session_state.setdefault("_used_tmpl", set())
 
-    # 근거 후보
     q1to4 = [answers[i][3:].strip() for i in [0,1,2,3] if answers[i]]
     q5to7 = [answers[i][3:].strip() for i in [4,5,6] if answers[i]]
 
@@ -463,6 +597,24 @@ def build_reason(answers: List[str], primary_genre: str, top_situations: List[st
     persona = genre_persona.get(primary_genre, "이런 성향")
 
     return tmpl.format(s_ev=s_ev, g_ev=g_ev, sit=sit_label, persona=persona, title=book.get("title",""), flavor=flavor, hook=hook).strip()
+
+# =====================================================
+# Sidebar: API key quick test
+# =====================================================
+st.sidebar.subheader("🔍 국립중앙도서관 API 키 테스트")
+test_query = st.sidebar.text_input("테스트 쿼리(기본: '소설')", value="소설")
+if st.sidebar.button("테스트 호출(1회)"):
+    debug_clear()
+    if not nl_api_key:
+        st.sidebar.error("cert_key가 비어있습니다.")
+    else:
+        try:
+            raw = nl_search_raw(nl_api_key, test_query, page_no=1, page_size=5,
+                                timeout=nl_timeout, retries=nl_retries, debug=True)
+            items = _extract_items(raw)
+            st.sidebar.success(f"호출 성공 ✅ / 추출 {len(items)}개")
+        except Exception as e:
+            st.sidebar.error(f"호출 실패 ❌: {type(e).__name__}: {e}")
 
 # =====================================================
 # UI: Questionnaire
@@ -491,9 +643,11 @@ if load_summary_clicked:
 # Flow
 # =====================================================
 if clicked:
+    if debug_mode:
+        debug_clear()
+
     answers = [st.session_state[f"q{i+1}"] for i in range(7)]
 
-    # ✅ result는 항상 기본 스키마로 초기화 (KeyError 방지)
     st.session_state.result = {
         "answers": answers,
         "genre_scores": {},
@@ -506,6 +660,7 @@ if clicked:
         "picked": [],
         "raw_first_pool_item": None,
         "error": "",
+        "nl_errors": [],
     }
 
     if any(a is None for a in answers):
@@ -517,75 +672,87 @@ if clicked:
         st.session_state.submitted = True
     else:
         with st.spinner("분석 + 후보 리스트 가져오는 중..."):
-            genre_scores = compute_genre_scores(answers)
-            situation_scores = compute_situation_scores(answers)
+            try:
+                genre_scores = compute_genre_scores(answers)
+                situation_scores = compute_situation_scores(answers)
 
-            focus_genres = top_two(genre_scores)
-            top_situations = top_list(situation_scores)
+                focus_genres = top_two(genre_scores)
+                top_situations = top_list(situation_scores)
 
-            pool, used_queries = fetch_candidate_pool_from_nl(
-                cert_key=nl_api_key,
-                focus_genres=focus_genres,
-                top_situations=top_situations,
-                target_pool_size=pool_size,
-                timeout=nl_timeout,
-                retries=nl_retries,
-            )
-
-            st.session_state.result.update({
-                "genre_scores": genre_scores,
-                "situation_scores": situation_scores,
-                "focus_genres": focus_genres,
-                "top_situations": top_situations,
-                "used_queries": used_queries,
-                "pool_count": len(pool),
-                "raw_first_pool_item": pool[0].get("raw") if pool else None,
-            })
-
-            if not pool:
-                st.session_state.result["error"] = "후보를 가져오지 못했어요. (키/네트워크/쿼리 문제 가능)"
-            else:
-                picked = []
-                used_ai = False
-                if openai_api_key:
-                    try:
-                        picked = ai_choose_from_pool(answers, focus_genres, top_situations, pool)
-                        if len(picked) == 3:
-                            used_ai = True
-                        else:
-                            picked = fallback_choose_from_pool(pool)
-                            used_ai = False
-                    except Exception:
-                        picked = fallback_choose_from_pool(pool)
-                        used_ai = False
-                else:
-                    picked = fallback_choose_from_pool(pool)
-                    used_ai = False
-
-                # 줄거리 로딩
-                if fetch_summary_default or st.session_state.summary_loaded:
-                    for b in picked:
-                        b["summary"] = get_summary_for_book(b)
-                else:
-                    for b in picked:
-                        b["summary"] = ""
-
-                # 추천 이유 생성 (genre는 상위 1개로 통일)
-                primary_genre = focus_genres[0] if focus_genres else "소설"
-                # used set 초기화
-                st.session_state["_used_genre_ev"] = set()
-                st.session_state["_used_sit_ev"] = set()
-                st.session_state["_used_flavor"] = set()
-                st.session_state["_used_tmpl"] = set()
-
-                for idx, b in enumerate(picked):
-                    b["genre"] = primary_genre
-                    b["why"] = build_reason(answers, primary_genre, top_situations, idx, b)
+                pool, used_queries, nl_errors = fetch_candidate_pool_from_nl(
+                    cert_key=nl_api_key,
+                    focus_genres=focus_genres,
+                    top_situations=top_situations,
+                    target_pool_size=pool_size,
+                    timeout=nl_timeout,
+                    retries=nl_retries,
+                    debug=debug_mode,
+                )
 
                 st.session_state.result.update({
-                    "picked": picked,
-                    "used_ai": used_ai,
+                    "genre_scores": genre_scores,
+                    "situation_scores": situation_scores,
+                    "focus_genres": focus_genres,
+                    "top_situations": top_situations,
+                    "used_queries": used_queries,
+                    "pool_count": len(pool),
+                    "raw_first_pool_item": pool[0].get("raw") if pool else None,
+                    "nl_errors": nl_errors,
                 })
+
+                if not pool:
+                    # 후보 0개일 때도 디버그 힌트를 UI로 더 보여주기
+                    hint = "후보를 가져오지 못했어요. (키/네트워크/쿼리 문제 가능)"
+                    if debug_mode and nl_errors:
+                        hint += f"\n\n디버그: 쿼리별 실패 {len(nl_errors)}건 (아래 로그 확인)"
+                    st.session_state.result["error"] = hint
+                else:
+                    picked = []
+                    used_ai = False
+                    if openai_api_key:
+                        try:
+                            picked = ai_choose_from_pool(answers, focus_genres, top_situations, pool, openai_api_key, openai_model)
+                            if len(picked) == 3:
+                                used_ai = True
+                            else:
+                                picked = fallback_choose_from_pool(pool)
+                                used_ai = False
+                        except Exception:
+                            if debug_mode:
+                                debug_log("openai_choose_failed", traceback=traceback.format_exc())
+                            picked = fallback_choose_from_pool(pool)
+                            used_ai = False
+                    else:
+                        picked = fallback_choose_from_pool(pool)
+                        used_ai = False
+
+                    # 줄거리 로딩
+                    if fetch_summary_default or st.session_state.summary_loaded:
+                        for b in picked:
+                            b["summary"] = get_summary_for_book(b)
+                    else:
+                        for b in picked:
+                            b["summary"] = ""
+
+                    primary_genre = focus_genres[0] if focus_genres else "소설"
+                    st.session_state["_used_genre_ev"] = set()
+                    st.session_state["_used_sit_ev"] = set()
+                    st.session_state["_used_flavor"] = set()
+                    st.session_state["_used_tmpl"] = set()
+
+                    for idx, b in enumerate(picked):
+                        b["genre"] = primary_genre
+                        b["why"] = build_reason(answers, primary_genre, top_situations, idx, b)
+
+                    st.session_state.result.update({
+                        "picked": picked,
+                        "used_ai": used_ai,
+                    })
+            except Exception as e:
+                # 전체 플로우 레벨 예외도 잡아서 디버그 로그에 남김
+                if debug_mode:
+                    debug_log("flow_exception", error=str(e), type=type(e).__name__, traceback=traceback.format_exc())
+                st.session_state.result["error"] = f"처리 중 예외가 발생했습니다: {type(e).__name__}: {e}"
 
         st.session_state.submitted = True
 
@@ -597,6 +764,18 @@ if st.session_state.submitted and st.session_state.result:
 
     if r.get("error"):
         st.error(r["error"])
+
+        # 디버그 모드면, 실패 원인을 바로 볼 수 있게 로그 표시
+        if debug_mode and debug_show_logs:
+            with st.expander("🧪 디버그 로그(실패 원인 추적)"):
+                _ensure_debug_state()
+                st.write(f"- 로그 개수: {len(st.session_state._debug_logs)}")
+                if r.get("nl_errors"):
+                    st.write("**쿼리별 에러 요약**")
+                    st.json(r["nl_errors"])
+                st.write("**상세 로그**")
+                st.json(st.session_state._debug_logs)
+
     else:
         st.subheader("📌 분석 결과")
         focus_genres = r.get("focus_genres", [])
@@ -617,6 +796,12 @@ if st.session_state.submitted and st.session_state.result:
         if debug_show_raw and r.get("raw_first_pool_item"):
             with st.expander("🧪 후보 1개 raw JSON"):
                 st.json(r["raw_first_pool_item"])
+
+        # 성공 시에도 원하면 디버그 로그 표시
+        if debug_mode and debug_show_logs:
+            with st.expander("🧪 디버그 로그(성공했지만 확인용)"):
+                _ensure_debug_state()
+                st.json(st.session_state._debug_logs)
 
         st.subheader("📚 추천 도서 3권")
         for i, b in enumerate(r.get("picked", []), start=1):
