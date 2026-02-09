@@ -3,7 +3,7 @@ import random
 import re
 import time
 from html import unescape
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List
 
 import requests
 import streamlit as st
@@ -88,14 +88,6 @@ genre_persona = {
     "소설": "감정·분위기·서사 몰입을 통해 회복하는 감성형",
 }
 
-genre_book_point = {
-    "자기계발": "바로 적용 가능한 습관·실행 포인트",
-    "인문/철학": "감정과 생각을 정리해주는 통찰",
-    "과학/IT": "새로운 지식과 원리를 이해하는 재미",
-    "역사/사회": "세상 흐름을 읽고 관점을 넓히는 내용",
-    "소설": "감정적으로 몰입하며 위로와 여운을 주는 서사",
-}
-
 genre_flavors = {
     "자기계발": ["실행", "루틴", "동기부여", "습관", "자기관리"],
     "인문/철학": ["성찰", "관점", "자기이해", "가치", "질문"],
@@ -112,7 +104,7 @@ situation_tag_map_q5_to_q7 = {
 tag_display = {"동기": "방향/동기부여", "위로": "감정 정리/위로", "휴식": "휴식/회복", "탐구": "호기심/탐구"}
 
 # =====================================================
-# Demo fallback pool (한국어/번역서 혼합이지만 한국어로 유통되는 책들)
+# Demo fallback pool
 # =====================================================
 fallback_pool = {
     "자기계발": [{"title": "아주 작은 습관의 힘", "author": "제임스 클리어"},{"title": "그릿", "author": "앤절라 더크워스"},{"title": "딥 워크", "author": "칼 뉴포트"},{"title": "원씽", "author": "게리 켈러"},{"title": "미라클 모닝", "author": "할 엘로드"}],
@@ -171,12 +163,10 @@ def top_keys(scores: Dict[str, int]):
     r = ranked(scores)
     maxv = r[0][1]
     top = [k for k, v in r if v == maxv]
-    # second tier for fallback mixing
     second = [k for k, v in r if v == (r[1][1] if len(r) > 1 else -1)]
     return top, second, r
 
 def pick_3_books(top_genres: List[str], second_genres: List[str]):
-    # 복합 성향이면 섞고, 아니면 1등 2권 + 2등 1권(있으면)
     if len(top_genres) >= 2:
         pool = []
         for g in top_genres[:2]:
@@ -263,7 +253,6 @@ def build_reason_diversified(
     g_ev = rotate_pick(g_candidates, used_genre_ev, fallback=(g_candidates[0] if g_candidates else "책에서 얻고 싶은 게 있다"))
     s_ev = rotate_pick(s_candidates, used_sit_ev, fallback="요즘 책이 필요하다")
 
-    # 근거가 빈 경우 대비
     if s_ev == "요즘 책이 필요하다":
         q5to7 = [answers[i][3:].strip() for i in [4, 5, 6] if answers[i]]
         if q5to7:
@@ -324,7 +313,7 @@ def ai_pick_books_korean_only(answers: List[str], focus_genres: List[str], top_s
     recs = obj.get("recommendations", [])
 
     cleaned = []
-    for r in recs[:5]:  # 여유 있게 받고 3개로 자름
+    for r in recs[:5]:
         title = str(r.get("title", "")).strip()
         author = str(r.get("author", "")).strip()
         genre = str(r.get("genre", "")).strip()
@@ -333,9 +322,7 @@ def ai_pick_books_korean_only(answers: List[str], focus_genres: List[str], top_s
         if title:
             cleaned.append({"title": title, "author": author, "genre": genre})
 
-    # 중복 제거
-    uniq = []
-    seen = set()
+    uniq, seen = [], set()
     for c in cleaned:
         if c["title"] in seen:
             continue
@@ -346,7 +333,7 @@ def ai_pick_books_korean_only(answers: List[str], focus_genres: List[str], top_s
     return uniq
 
 # =====================================================
-# Networking (fast)
+# Networking
 # =====================================================
 def requests_get(url, params=None, timeout=10, retries=1):
     last = None
@@ -420,6 +407,7 @@ def fetch_text_from_url(url: str, max_chars: int = 650, timeout: int = 10, retri
         return ""
 
 def fetch_one_book_nl(c: dict) -> dict:
+    # UI를 깔끔하게 유지하기 위해 실패 note는 저장만 하고(혹은 빈값) 화면에선 미출력
     if not nl_api_key:
         return {**c, "isbn": "", "cover_url": "", "summary": "", "note": ""}
 
@@ -434,7 +422,7 @@ def fetch_one_book_nl(c: dict) -> dict:
         )
         item = pick_best_item(nl_json, c["title"])
         if not item:
-            return {**c, "isbn": "", "cover_url": "", "summary": "", "note": "검색 결과가 없어 서지정보를 가져오지 못했어요."}
+            return {**c, "isbn": "", "cover_url": "", "summary": "", "note": ""}
 
         isbn = item.get("EA_ISBN") or item.get("ISBN") or item.get("isbn") or ""
         cover_url = item.get("TITLE_URL") or item.get("cover") or item.get("image") or ""
@@ -458,9 +446,8 @@ def fetch_one_book_nl(c: dict) -> dict:
         }
 
     except (ReadTimeout, ConnectionError, HTTPError, RequestException):
-        if demo_mode:
-            return {**c, "isbn": "", "cover_url": "", "summary": "", "note": "API 응답이 느려서(Timeout/오류) 서지정보를 생략했어요."}
-        raise
+        # demo_mode라도 UI 경고를 띄우지 않기 위해 note는 비움
+        return {**c, "isbn": "", "cover_url": "", "summary": "", "note": ""}
 
 # =====================================================
 # UI: Questionnaire
@@ -507,10 +494,8 @@ if clicked:
             situation_scores = compute_situation_scores(answers)
             top_situations, _, _ = top_keys(situation_scores)
 
-            # focus: 최대 2개 장르
             focus_genres = top_genres[:2] if len(top_genres) >= 2 else (top_genres + second_genres[:1])
 
-            # 1) AI 추천(가능하면)
             candidates: List[dict] = []
             used_ai = False
             if openai_api_key:
@@ -523,13 +508,11 @@ if clicked:
                     candidates = []
                     used_ai = False
 
-            # 2) 실패/미입력 시 fallback
             if len(candidates) < 3:
                 fb = pick_3_books(top_genres, second_genres)
                 candidates = [{"title": b["title"], "author": b.get("author", ""), "genre": b["genre"]} for b in fb]
                 used_ai = False
 
-            # ✅ 책마다 이유가 다르게 생성
             used_genre_ev, used_sit_ev, used_flavor, used_template = set(), set(), set(), set()
             enriched = []
             for idx, c in enumerate(candidates[:3]):
@@ -546,7 +529,6 @@ if clicked:
                 )
                 enriched.append({**c, "why": why})
 
-            # ✅ 병렬로 3권 조회 (표지/ISBN 우선)
             books_final = []
             used_nl = False
             if nl_api_key:
@@ -555,7 +537,6 @@ if clicked:
                     futures = [ex.submit(fetch_one_book_nl, c) for c in enriched]
                     for f in as_completed(futures):
                         books_final.append(f.result())
-                # 추천 순서 유지(원래 리스트 기준) - title 기반으로 정렬
                 order = {b["title"]: i for i, b in enumerate(enriched)}
                 books_final.sort(key=lambda x: order.get(x["title"], 999))
             else:
@@ -574,29 +555,27 @@ if clicked:
             }
 
 # =====================================================
-# Render
+# Render (깔끔 버전: 없으면 그냥 안 그린다)
 # =====================================================
 if st.session_state.submitted and st.session_state.result:
     r = st.session_state.result
-    st.subheader("📌 분석 결과")
 
+    st.subheader("📌 분석 결과")
     st.success(f"독서 성향: {', '.join(r['genre_top'])}")
     sit_text = ", ".join([tag_display.get(t, t) for t in r["situation_top"]])
     st.info(f"현재 필요한 것: **{sit_text}**")
 
+    # 상태 안내 문구는 최소만 (원하면 이것도 제거 가능)
     if r.get("used_ai"):
-        st.caption("✅ OpenAI를 사용해 '한국어로 출간/유통되는 책' 3권을 추천했습니다.")
+        st.caption("✅ OpenAI 기반 추천")
     else:
-        st.caption("ℹ️ OpenAI 미사용/실패로 데모 추천 목록을 사용했습니다.")
-
-    if r.get("used_nl"):
-        st.caption("※ 속도 개선: 기본은 표지/ISBN만 조회합니다. 줄거리는 ‘줄거리 불러오기’ 버튼으로 지연 로딩하세요.")
-    else:
-        st.warning("국립중앙도서관 API 키가 없어서 표지/ISBN/줄거리는 표시되지 않습니다.")
+        st.caption("ℹ️ 데모 추천 목록 기반")
 
     st.subheader("📚 추천 도서 3권")
+
     for idx, b in enumerate(r["books"], start=1):
         st.markdown(f"### {idx}. {b['title']}")
+
         meta = []
         if b.get("author"):
             meta.append(f"저자: {b['author']}")
@@ -606,23 +585,20 @@ if st.session_state.submitted and st.session_state.result:
             st.caption(" · ".join(meta))
 
         cols = st.columns([1, 2])
+
+        # 표지: URL 있을 때만 이미지 표시 (없으면 아무것도 안 보여줌)
         with cols[0]:
             if b.get("cover_url"):
                 st.image(b["cover_url"], use_container_width=True)
-            else:
-                st.info("표지 없음/조회 실패")
 
         with cols[1]:
-            st.write("**추천 이유(책마다 다르게 생성됨)**")
-            st.write(f"- {b.get('why', '')}")
+            st.write("**추천 이유**")
+            if b.get("why"):
+                st.write(f"- {b['why']}")
 
-            st.write("**줄거리/책소개**")
+            # 줄거리: 내용 있을 때만 섹션 표시 (없으면 아무것도 안 보여줌)
             if b.get("summary"):
+                st.write("**줄거리/책소개**")
                 st.write(b["summary"])
-            else:
-                st.info("줄거리 미로딩(버튼으로 불러올 수 있어요) 또는 제공 URL 없음/실패")
-
-            if b.get("note"):
-                st.warning(b["note"])
 
         st.divider()
