@@ -2,41 +2,15 @@ import json
 import random
 import re
 import time
-import traceback
 from html import unescape
 from typing import Dict, List, Tuple, Optional
-from urllib.parse import urlencode
 
 import requests
 import streamlit as st
 from requests.exceptions import ReadTimeout, ConnectionError, HTTPError, RequestException
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# =====================================================
-# Streamlit Setup
-# =====================================================
 st.set_page_config(page_title="나와 어울리는 책은?", page_icon="📚", layout="centered")
-
-# =====================================================
-# Debug helpers
-# =====================================================
-def _ensure_debug_state():
-    if "_debug_logs" not in st.session_state:
-        st.session_state._debug_logs = []
-    if "_debug_last_nl" not in st.session_state:
-        st.session_state._debug_last_nl = None
-
-def debug_log(event: str, **data):
-    _ensure_debug_state()
-    st.session_state._debug_logs.append({
-        "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "event": event,
-        "data": data
-    })
-
-def debug_clear():
-    _ensure_debug_state()
-    st.session_state._debug_logs = []
-    st.session_state._debug_last_nl = None
 
 # =====================================================
 # Sidebar
@@ -51,40 +25,32 @@ nl_api_key = st.sidebar.text_input(
 openai_api_key = st.sidebar.text_input(
     "OpenAI API Key (선택)",
     type="password",
-    help="입력하면 후보 리스트 중에서 AI가 3권을 선택합니다. 없으면 규칙 기반으로 고릅니다.",
+    help="입력하면 AI가 '한국어 책' 3권을 추천합니다. 없으면 데모 추천 목록으로 동작합니다.",
 )
+
 openai_model = st.sidebar.text_input("OpenAI 모델", value="gpt-4o-mini")
 
-st.sidebar.subheader("⚡ 속도 옵션")
-pool_size = st.sidebar.slider("후보 풀(가져올 책 개수)", 20, 120, 60, 10)
-nl_timeout = st.sidebar.slider("국립중앙도서관 API 타임아웃(초)", 5, 30, 10, 1)
-nl_retries = st.sidebar.slider("국립중앙도서관 API 재시도 횟수", 0, 2, 1, 1)
+demo_mode = st.sidebar.checkbox(
+    "데모 모드(서지정보 실패해도 결과 보기)",
+    value=True,
+)
 
+st.sidebar.subheader("⚡ 속도 옵션(추천)")
 fetch_summary_default = st.sidebar.checkbox(
     "줄거리/책소개도 바로 가져오기(느림)",
     value=False,
+    help="OFF 권장: 기본은 표지/ISBN만 조회해서 빠르게 보여줍니다. 줄거리는 버튼으로 지연 로딩 가능.",
 )
 
-st.sidebar.subheader("🧪 디버그")
-debug_mode = st.sidebar.checkbox("디버그 모드 ON", value=False)
-debug_verbose = st.sidebar.checkbox("응답 일부(앞 800자)까지 기록", value=True)
-debug_show_raw = st.sidebar.checkbox("후보 1개 raw JSON 보기", value=False)
-debug_show_logs = st.sidebar.checkbox("디버그 로그 표시", value=True)
-
-col_dbg1, col_dbg2 = st.sidebar.columns(2)
-with col_dbg1:
-    if st.button("디버그 로그 초기화"):
-        debug_clear()
-with col_dbg2:
-    pass
-
-st.sidebar.caption("디버그 ON이면 캐시를 우회해 매 호출을 기록합니다(문제 재현/추적용).")
+nl_timeout = st.sidebar.slider("국립중앙도서관 API 타임아웃(초)", 5, 30, 10, 1)
+nl_retries = st.sidebar.slider("국립중앙도서관 API 재시도 횟수", 0, 2, 1, 1)
+max_workers = st.sidebar.slider("동시 요청 수(병렬 처리)", 1, 6, 3, 1)
 
 # =====================================================
 # Header
 # =====================================================
 st.title("📚 나와 어울리는 책은?")
-st.write("성향(장르) + 상황(지금 필요한 것)을 분석하고, **국립중앙도서관 후보 리스트 중에서** 3권을 골라 추천합니다.")
+st.write("성향(장르) + 상황(지금 필요한 것)을 함께 분석해 책 3권을 추천합니다.")
 
 # =====================================================
 # Questions
@@ -122,6 +88,14 @@ genre_persona = {
     "소설": "감정·분위기·서사 몰입을 통해 회복하는 감성형",
 }
 
+genre_book_point = {
+    "자기계발": "바로 적용 가능한 습관·실행 포인트",
+    "인문/철학": "감정과 생각을 정리해주는 통찰",
+    "과학/IT": "새로운 지식과 원리를 이해하는 재미",
+    "역사/사회": "세상 흐름을 읽고 관점을 넓히는 내용",
+    "소설": "감정적으로 몰입하며 위로와 여운을 주는 서사",
+}
+
 genre_flavors = {
     "자기계발": ["실행", "루틴", "동기부여", "습관", "자기관리"],
     "인문/철학": ["성찰", "관점", "자기이해", "가치", "질문"],
@@ -137,22 +111,19 @@ situation_tag_map_q5_to_q7 = {
 }
 tag_display = {"동기": "방향/동기부여", "위로": "감정 정리/위로", "휴식": "휴식/회복", "탐구": "호기심/탐구"}
 
-genre_seed_keywords = {
-    "자기계발": ["습관", "공부", "시간관리", "목표", "루틴"],
-    "인문/철학": ["철학", "사유", "인간", "관계", "의미"],
-    "과학/IT": ["AI", "데이터", "과학", "프로그래밍", "코딩"],
-    "역사/사회": ["사회", "역사", "정치", "경제", "세계"],
-    "소설": ["소설", "장편", "청춘", "관계", "힐링"],
-}
-situation_seed_keywords = {
-    "위로": ["위로", "마음", "불안", "치유"],
-    "휴식": ["힐링", "휴식", "쉼"],
-    "동기": ["동기", "성장", "목표", "공부"],
-    "탐구": ["호기심", "질문", "탐구", "미래"],
+# =====================================================
+# Demo fallback pool (한국어/번역서 혼합이지만 한국어로 유통되는 책들)
+# =====================================================
+fallback_pool = {
+    "자기계발": [{"title": "아주 작은 습관의 힘", "author": "제임스 클리어"},{"title": "그릿", "author": "앤절라 더크워스"},{"title": "딥 워크", "author": "칼 뉴포트"},{"title": "원씽", "author": "게리 켈러"},{"title": "미라클 모닝", "author": "할 엘로드"}],
+    "인문/철학": [{"title": "정의란 무엇인가", "author": "마이클 샌델"},{"title": "죽음의 수용소에서", "author": "빅터 프랭클"},{"title": "소크라테스 익스프레스", "author": "에릭 와이너"},{"title": "철학은 어떻게 삶의 무기가 되는가", "author": "야마구치 슈"},{"title": "사피엔스", "author": "유발 하라리"}],
+    "과학/IT": [{"title": "코스모스", "author": "칼 세이건"},{"title": "팩트풀니스", "author": "한스 로슬링"},{"title": "클린 코드", "author": "로버트 C. 마틴"},{"title": "AI 2041", "author": "카이푸 리, 천치우판"},{"title": "이기적 유전자", "author": "리처드 도킨스"}],
+    "역사/사회": [{"title": "총, 균, 쇠", "author": "재레드 다이아몬드"},{"title": "넛지", "author": "리처드 탈러, 캐스 선스타인"},{"title": "역사의 쓸모", "author": "최태성"},{"title": "21세기 자본", "author": "토마 피케티"},{"title": "정치의 심리학", "author": "드루 웨스턴"}],
+    "소설": [{"title": "나미야 잡화점의 기적", "author": "히가시노 게이고"},{"title": "불편한 편의점", "author": "김호연"},{"title": "1984", "author": "조지 오웰"},{"title": "달러구트 꿈 백화점", "author": "이미예"},{"title": "데미안", "author": "헤르만 헤세"}],
 }
 
 # =====================================================
-# Session State init
+# Session state
 # =====================================================
 if "submitted" not in st.session_state:
     st.session_state.submitted = False
@@ -162,8 +133,9 @@ if "summary_loaded" not in st.session_state:
     st.session_state.summary_loaded = False
 
 for i in range(7):
-    if f"q{i+1}" not in st.session_state:
-        st.session_state[f"q{i+1}"] = None
+    k = f"q{i+1}"
+    if k not in st.session_state:
+        st.session_state[k] = None
 
 def reset_test():
     for i in range(7):
@@ -171,11 +143,6 @@ def reset_test():
     st.session_state.submitted = False
     st.session_state.result = None
     st.session_state.summary_loaded = False
-    # 추천문구 다양화용 used set도 초기화
-    st.session_state.pop("_used_genre_ev", None)
-    st.session_state.pop("_used_sit_ev", None)
-    st.session_state.pop("_used_flavor", None)
-    st.session_state.pop("_used_tmpl", None)
 
 # =====================================================
 # Scoring
@@ -184,7 +151,7 @@ def letter_of(ans: str) -> str:
     return ans.strip()[0]
 
 def compute_genre_scores(answers: List[str]) -> Dict[str, int]:
-    scores = {g: 0 for g in set(genre_map.values())}
+    scores = {g: 0 for g in genre_map.values()}
     for a in answers:
         scores[genre_map[letter_of(a)]] += 1
     return scores
@@ -200,357 +167,56 @@ def compute_situation_scores(answers: List[str]) -> Dict[str, int]:
 def ranked(scores: Dict[str, int]):
     return sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
-def top_two(scores: Dict[str, int]) -> List[str]:
+def top_keys(scores: Dict[str, int]):
     r = ranked(scores)
-    if not r:
-        return []
-    top = [k for k, v in r if v == r[0][1]]
-    if len(top) >= 2:
-        return top[:2]
-    for k, v in r:
-        if v < r[0][1]:
-            return top + [k]
-    return top
+    maxv = r[0][1]
+    top = [k for k, v in r if v == maxv]
+    # second tier for fallback mixing
+    second = [k for k, v in r if v == (r[1][1] if len(r) > 1 else -1)]
+    return top, second, r
 
-def top_list(scores: Dict[str, int]) -> List[str]:
-    r = ranked(scores)
-    if not r:
-        return []
-    topv = r[0][1]
-    return [k for k, v in r if v == topv]
+def pick_3_books(top_genres: List[str], second_genres: List[str]):
+    # 복합 성향이면 섞고, 아니면 1등 2권 + 2등 1권(있으면)
+    if len(top_genres) >= 2:
+        pool = []
+        for g in top_genres[:2]:
+            pool += [{"genre": g, **b} for b in fallback_pool[g]]
+        random.shuffle(pool)
+        out, seen = [], set()
+        for item in pool:
+            if item["title"] in seen:
+                continue
+            out.append(item)
+            seen.add(item["title"])
+            if len(out) == 3:
+                break
+        return out
 
-# =====================================================
-# Networking (with debug)
-# =====================================================
-def requests_get(url, params=None, timeout=10, retries=1, debug=False):
-    last = None
-    for i in range(retries + 1):
-        try:
-            if debug:
-                debug_log("http_request", method="GET", url=url, params=params, timeout=timeout, attempt=i, retries=retries)
-            r = requests.get(url, params=params, timeout=timeout)
-            if debug:
-                debug_log("http_response_meta",
-                          status_code=r.status_code,
-                          content_type=r.headers.get("Content-Type", ""),
-                          final_url=r.url)
-                if debug_verbose:
-                    debug_log("http_response_head", head=r.text[:800])
-            return r
-        except (ReadTimeout, ConnectionError) as e:
-            last = e
-            if debug:
-                debug_log("http_exception_retryable", error=str(e), type=type(e).__name__, attempt=i, retries=retries,
-                          traceback=traceback.format_exc())
-            if i == retries:
-                raise
-            time.sleep(0.4 * (2**i))
-        except Exception as e:
-            if debug:
-                debug_log("http_exception_fatal", error=str(e), type=type(e).__name__, traceback=traceback.format_exc())
-            raise
-    raise last
-
-@st.cache_data(show_spinner=False)
-def nl_search_raw_cached(cert_key: str, title_query: str, page_no: int, page_size: int, timeout: int, retries: int, cache_buster: str) -> dict:
-    # cache_buster는 디버그 모드에서 캐시 우회용(값이 바뀌면 캐시 키가 바뀜)
-    url = "https://www.nl.go.kr/seoji/SearchApi.do"
-    params = {
-        "cert_key": cert_key,
-        "result_style": "json",
-        "page_no": page_no,
-        "page_size": page_size,
-        "title": title_query,
-    }
-    r = requests_get(url, params=params, timeout=timeout, retries=retries, debug=False)
-    r.raise_for_status()
-    try:
-        return r.json()
-    except Exception:
-        return json.loads(r.text)
-
-def nl_search_raw(cert_key: str, title_query: str, page_no: int, page_size: int, timeout: int, retries: int, debug: bool) -> dict:
-    """
-    debug=False: 캐시 사용 (빠름)
-    debug=True : 캐시 우회 + 상세 로그 기록 (추적용)
-    """
-    url = "https://www.nl.go.kr/seoji/SearchApi.do"
-    params = {
-        "cert_key": cert_key,
-        "result_style": "json",
-        "page_no": page_no,
-        "page_size": page_size,
-        "title": title_query,
-    }
-
-    if not debug:
-        # 캐시 사용
-        return nl_search_raw_cached(cert_key, title_query, page_no, page_size, timeout, retries, cache_buster="")
-
-    # 디버그: 캐시 우회 + 로그
-    try:
-        debug_log("nl_request_prepared", base_url=url, query=urlencode(params, doseq=True))
-        r = requests_get(url, params=params, timeout=timeout, retries=retries, debug=True)
-        # 상태코드가 200이 아니면 여기서 raise
-        r.raise_for_status()
-        st.session_state._debug_last_nl = {
-            "status_code": r.status_code,
-            "content_type": r.headers.get("Content-Type", ""),
-            "final_url": r.url,
-        }
-        try:
-            data = r.json()
-        except Exception:
-            debug_log("nl_json_parse_failed", note="response not json -> fallback json.loads(text)", traceback=traceback.format_exc())
-            data = json.loads(r.text)
-
-        debug_log("nl_response_parsed", top_keys=list(data.keys()) if isinstance(data, dict) else str(type(data)))
-        return data
-    except Exception as e:
-        debug_log("nl_search_raw_exception", error=str(e), type=type(e).__name__, traceback=traceback.format_exc())
-        raise
-
-def _extract_items(nl_json: dict) -> List[dict]:
-    """
-    응답 포맷이 바뀌거나 중첩되는 경우가 있어 최대한 관대하게 추출.
-    """
-    if not isinstance(nl_json, dict):
-        return []
-
-    # 1) 흔한 키들
-    for k in ["docs", "data", "items", "result", "DOCS", "ITEMS"]:
-        if k in nl_json and isinstance(nl_json[k], list):
-            return nl_json[k]
-
-    # 2) 중첩 (예: { "SEARH": { "docs": [...] } } 같은 케이스)
-    for v in nl_json.values():
-        if isinstance(v, dict):
-            for k in ["docs", "data", "items", "result"]:
-                if k in v and isinstance(v[k], list):
-                    return v[k]
-
-    # 3) 최후: dict 내부 어딘가 list[dict] 탐색
-    for v in nl_json.values():
-        if isinstance(v, list) and v and isinstance(v[0], dict):
-            return v
-
-    return []
-
-def _normalize_item(it: dict) -> dict:
-    title = (it.get("TITLE") or it.get("title") or "").strip()
-    author = (it.get("AUTHOR") or it.get("author") or "").strip()
-    publisher = (it.get("PUBLISHER") or it.get("publisher") or "").strip()
-    isbn = (it.get("EA_ISBN") or it.get("ISBN") or it.get("isbn") or "").strip()
-    cover_url = (it.get("TITLE_URL") or it.get("cover") or it.get("image") or "").strip()
-    intro_url = (it.get("BOOK_INTRODUCTION_URL") or it.get("intro_url") or "").strip()
-    summary_url = (it.get("BOOK_SUMMARY_URL") or it.get("summary_url") or "").strip()
-    pub_year = (it.get("PUBLISH_PREDATE") or it.get("PUBLISH_DATE") or it.get("publish_date") or "").strip()
-    pub_year = pub_year[:4] if pub_year else ""
-    kdc_name = (it.get("KDC_NAME") or it.get("kdc_name") or "").strip()
-    return {
-        "title": title,
-        "author": author,
-        "publisher": publisher,
-        "isbn": isbn,
-        "cover_url": cover_url,
-        "intro_url": intro_url,
-        "summary_url": summary_url,
-        "pub_year": pub_year,
-        "kdc_name": kdc_name,
-        "raw": it,
-    }
-
-def _dedup_items(items: List[dict]) -> List[dict]:
-    seen = set()
-    out = []
-    for it in items:
-        key = it.get("isbn") or (it.get("title", "") + "|" + it.get("author", ""))
-        key = key.strip()
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        out.append(it)
-    return out
-
-def build_nl_queries(focus_genres: List[str], top_situations: List[str]) -> List[str]:
-    queries = []
-    for g in focus_genres[:2]:
-        gw = genre_seed_keywords.get(g, [])
-        if top_situations:
-            sw = situation_seed_keywords.get(top_situations[0], [])
-            if gw and sw:
-                queries.append(f"{random.choice(sw)} {random.choice(gw)}")
-            elif gw:
-                queries.append(random.choice(gw))
-        elif gw:
-            queries.append(random.choice(gw))
-    if top_situations:
-        sw = situation_seed_keywords.get(top_situations[0], [])
-        if sw:
-            queries.append(random.choice(sw))
-    uniq = []
-    for q in queries:
-        q = q.strip()
-        if q and q not in uniq:
-            uniq.append(q)
-    return uniq[:3]
-
-def fetch_candidate_pool_from_nl(cert_key: str, focus_genres: List[str], top_situations: List[str],
-                                 target_pool_size: int, timeout: int, retries: int, debug: bool):
-    used_queries = build_nl_queries(focus_genres, top_situations)
-    all_items: List[dict] = []
-    per_query_page_size = max(10, min(50, target_pool_size // max(1, len(used_queries))))
-    per_query_page_size = min(per_query_page_size, 50)
-
-    if debug:
-        debug_log("pool_fetch_start", used_queries=used_queries, per_query_page_size=per_query_page_size,
-                  target_pool_size=target_pool_size, timeout=timeout, retries=retries)
-
-    errors = []
-
-    for q in used_queries:
-        try:
-            raw = nl_search_raw(cert_key, title_query=q, page_no=1, page_size=per_query_page_size,
-                                timeout=timeout, retries=retries, debug=debug)
-            items_raw = _extract_items(raw)
-            if debug:
-                debug_log("pool_query_extract", query=q, extracted_count=len(items_raw),
-                          sample_keys=(list(items_raw[0].keys()) if items_raw and isinstance(items_raw[0], dict) else None))
-
-            items = [_normalize_item(it) for it in items_raw if isinstance(it, dict)]
-            all_items.extend(items)
-        except Exception as e:
-            errors.append({"query": q, "error": str(e), "type": type(e).__name__})
-            if debug:
-                debug_log("pool_query_failed", query=q, error=str(e), type=type(e).__name__, traceback=traceback.format_exc())
-            continue
-
-    all_items = _dedup_items(all_items)
-
-    if debug:
-        debug_log("pool_fetch_done", total_items=len(all_items), errors=errors)
-
-    if len(all_items) > target_pool_size:
-        all_items = all_items[:target_pool_size]
-    return all_items, used_queries, errors
+    primary = top_genres[0]
+    out = [{"genre": primary, **b} for b in random.sample(fallback_pool[primary], k=2)]
+    if second_genres and second_genres[0] != primary:
+        out.append({"genre": second_genres[0], **random.choice(fallback_pool[second_genres[0]])})
+        random.shuffle(out)
+        return out[:3]
+    return [{"genre": primary, **b} for b in random.sample(fallback_pool[primary], k=3)]
 
 # =====================================================
-# Lazy summary
+# Evidence + diversified reason generation
 # =====================================================
-@st.cache_data(show_spinner=False)
-def fetch_text_from_url(url: str, max_chars: int = 700, timeout: int = 10, retries: int = 0) -> str:
-    if not url:
-        return ""
-    try:
-        r = requests.get(url, timeout=timeout)
-        r.raise_for_status()
-        text = r.text
-        text = re.sub(r"<script.*?>.*?</script>", " ", text, flags=re.DOTALL | re.IGNORECASE)
-        text = re.sub(r"<style.*?>.*?</style>", " ", text, flags=re.DOTALL | re.IGNORECASE)
-        text = re.sub(r"<[^>]+>", " ", text)
-        text = unescape(text)
-        text = re.sub(r"\s+", " ", text).strip()
-        return (text[:max_chars].rstrip() + "…") if len(text) > max_chars else text
-    except RequestException:
-        return ""
+def evidence_by_genre(answers: List[str], target_genre: str) -> List[str]:
+    target_letter = next((l for l, g in genre_map.items() if g == target_genre), None)
+    return [a[3:].strip() for a in answers if target_letter and letter_of(a) == target_letter]
 
-def get_summary_for_book(book: dict) -> str:
-    s = ""
-    if book.get("summary_url"):
-        s = fetch_text_from_url(book["summary_url"], timeout=nl_timeout, retries=0)
-    if not s and book.get("intro_url"):
-        s = fetch_text_from_url(book["intro_url"], timeout=nl_timeout, retries=0)
-    return s.strip()
+def situation_evidence_candidates(answers: List[str], situation_tags: List[str]) -> List[str]:
+    ev = []
+    for qno in [5, 6, 7]:
+        ans = answers[qno - 1]
+        l = letter_of(ans)
+        tags = situation_tag_map_q5_to_q7[qno].get(l, [])
+        if any(t in situation_tags for t in tags):
+            ev.append(ans[3:].strip())
+    return ev
 
-# =====================================================
-# OpenAI choose-from-pool (optional)
-# =====================================================
-@st.cache_data(show_spinner=False)
-def call_openai_json(api_key: str, model: str, system: str, user: str) -> dict:
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    payload = {
-        "model": model,
-        "temperature": 0.4,
-        "response_format": {"type": "json_object"},
-        "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-    }
-    r = requests.post(url, headers=headers, json=payload, timeout=30)
-    r.raise_for_status()
-    return json.loads(r.json()["choices"][0]["message"]["content"])
-
-def ai_choose_from_pool(answers: List[str], focus_genres: List[str], top_situations: List[str], pool: List[dict], openai_api_key: str, openai_model: str) -> List[dict]:
-    pool_trim = pool[:40]
-    brief = []
-    for i, b in enumerate(pool_trim):
-        brief.append({
-            "id": i,
-            "title": b.get("title", ""),
-            "author": b.get("author", ""),
-            "publisher": b.get("publisher", ""),
-            "pub_year": b.get("pub_year", ""),
-            "isbn": b.get("isbn", ""),
-            "kdc_name": b.get("kdc_name", ""),
-        })
-
-    system = (
-        "너는 한국어 독서 큐레이터다.\n"
-        "사용자의 설문(성향+상황)을 반영해, 제공된 후보 리스트 안에서만 3권을 골라라.\n"
-        "서로 다른 책 3권을 고르고, 각 책에 대해 1문장 book_hook(책마다 다른 포인트)을 작성해라.\n"
-        "출력은 JSON만:\n"
-        '{ "picks": [{"id":0,"book_hook":"..."},{"id":1,"book_hook":"..."},{"id":2,"book_hook":"..."}] }\n'
-    )
-    user = (
-        f"focus_genres: {focus_genres}\n"
-        f"top_situations: {top_situations}\n"
-        "사용자 답변:\n" + "\n".join([f"- {a}" for a in answers]) + "\n\n"
-        "후보 리스트:\n" + json.dumps({"candidates": brief}, ensure_ascii=False)
-    )
-
-    obj = call_openai_json(openai_api_key, openai_model, system, user)
-    picks = obj.get("picks", [])
-
-    picked, used = [], set()
-    for p in picks:
-        try:
-            idx = int(p.get("id"))
-        except Exception:
-            continue
-        if idx < 0 or idx >= len(pool_trim) or idx in used:
-            continue
-        used.add(idx)
-        b = dict(pool_trim[idx])
-        b["book_hook"] = str(p.get("book_hook", "")).strip()
-        picked.append(b)
-        if len(picked) == 3:
-            break
-    return picked
-
-def fallback_choose_from_pool(pool: List[dict]) -> List[dict]:
-    def score(b):
-        s = 0
-        if b.get("isbn"): s += 3
-        if b.get("cover_url"): s += 2
-        if b.get("pub_year"): s += 1
-        if b.get("kdc_name"): s += 1
-        s += random.random() * 0.1
-        return s
-
-    sorted_pool = sorted(pool, key=score, reverse=True)
-    out, seen = [], set()
-    for b in sorted_pool:
-        key = b.get("isbn") or (b.get("title","") + "|" + b.get("author",""))
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        out.append({**b, "book_hook": ""})
-        if len(out) == 3:
-            break
-    return out
-
-# =====================================================
-# Reason generation (책마다 다르게)
-# =====================================================
 def rotate_pick(items: List[str], used: set, fallback: str = "") -> str:
     for it in items:
         if it and it not in used:
@@ -570,51 +236,231 @@ def pick_focus_tag(top_situations: List[str], idx: int) -> List[str]:
     return top_situations[:2]
 
 reason_templates = [
-    "최근 “{s_ev}”라고 답한 걸 보면 지금은 **{sit}**이(가) 필요해 보여요. {persona} 성향인 당신에게 **{title}**은(는) {flavor} 포인트로 도움이 될 수 있어요. {hook}",
-    "당신이 고른 답 중 “{g_ev}”가 눈에 띄어요. 그래서 {flavor}에 강한 **{title}**을(를) 골랐고, 특히 **{sit}**에 잘 맞을 거예요. {hook}",
-    "지금은 **{sit}**이(가) 우선일 것 같아요(“{s_ev}”). 동시에 {persona}답게 읽을 만한 **{title}**로 {flavor}을(를) 챙겨보면 좋아요. {hook}",
+    "최근 “{s_ev}”라고 답한 걸 보면 지금은 **{sit}**이(가) 필요해 보여요. 그리고 “{g_ev}” 선택이 많아 {persona} 성향도 강하네요. 그래서 **{title}**을(를) 추천합니다. ({flavor} 포인트에 특히 잘 맞아요.)",
+    "당신이 고른 답변 중 “{g_ev}”가 눈에 띄어요. {persona} 성향인 당신에게 **{sit}**을(를) 채워줄 책이 필요해서, {flavor}에 강한 **{title}**을(를) 골랐어요.",
+    "지금은 **{sit}**을(를) 얻는 게 우선일 것 같아요(“{s_ev}”). 동시에 “{g_ev}”를 선택한 걸 보면 {persona}답게 읽을 만한 책이 필요하죠. 그래서 **{title}**을(를) 추천합니다.",
+    "설문에서 “{s_ev}”라고 했던 점을 반영했어요. {persona} 성향의 당신에게 **{title}**은(는) {flavor}을 통해 **{sit}**에 도움을 줄 확률이 높아요.",
+    "현재 상태(“{s_ev}”)를 보면 **{sit}**을(를) 챙겨야 해요. 그리고 “{g_ev}” 선택은 {persona} 성향을 보여줘요. 그래서 {flavor}이(가) 강한 **{title}**을(를) 추천합니다.",
 ]
 
-def build_reason(answers: List[str], primary_genre: str, top_situations: List[str], idx: int, book: dict) -> str:
-    used_genre_ev = st.session_state.setdefault("_used_genre_ev", set())
-    used_sit_ev = st.session_state.setdefault("_used_sit_ev", set())
-    used_flavor = st.session_state.setdefault("_used_flavor", set())
-    used_tmpl = st.session_state.setdefault("_used_tmpl", set())
-
-    q1to4 = [answers[i][3:].strip() for i in [0,1,2,3] if answers[i]]
-    q5to7 = [answers[i][3:].strip() for i in [4,5,6] if answers[i]]
-
+def build_reason_diversified(
+    answers: List[str],
+    title: str,
+    genre: str,
+    top_situations: List[str],
+    idx: int,
+    used_genre_ev: set,
+    used_sit_ev: set,
+    used_flavor: set,
+    used_template: set,
+) -> str:
     focus_tags = pick_focus_tag(top_situations, idx)
     sit_label = ", ".join([tag_display.get(t, t) for t in focus_tags]) if focus_tags else "지금 필요한 것"
 
-    g_ev = rotate_pick(q1to4, used_genre_ev, fallback=(q1to4[0] if q1to4 else "책에서 얻고 싶은 게 있다"))
-    s_ev = rotate_pick(q5to7, used_sit_ev, fallback=(q5to7[0] if q5to7 else "요즘 책이 필요하다"))
-    flavor = rotate_pick(genre_flavors.get(primary_genre, []), used_flavor, fallback="핵심")
-    tmpl = rotate_pick(reason_templates, used_tmpl, fallback=reason_templates[idx % len(reason_templates)])
+    g_candidates = evidence_by_genre(answers, genre)
+    s_candidates = situation_evidence_candidates(answers, focus_tags) if focus_tags else []
 
-    hook = book.get("book_hook","").strip()
-    hook = f"({hook})" if hook else ""
-    persona = genre_persona.get(primary_genre, "이런 성향")
+    g_ev = rotate_pick(g_candidates, used_genre_ev, fallback=(g_candidates[0] if g_candidates else "책에서 얻고 싶은 게 있다"))
+    s_ev = rotate_pick(s_candidates, used_sit_ev, fallback="요즘 책이 필요하다")
 
-    return tmpl.format(s_ev=s_ev, g_ev=g_ev, sit=sit_label, persona=persona, title=book.get("title",""), flavor=flavor, hook=hook).strip()
+    # 근거가 빈 경우 대비
+    if s_ev == "요즘 책이 필요하다":
+        q5to7 = [answers[i][3:].strip() for i in [4, 5, 6] if answers[i]]
+        if q5to7:
+            s_ev = rotate_pick(q5to7, used_sit_ev, fallback=q5to7[0])
+    if g_ev == "책에서 얻고 싶은 게 있다":
+        q1to4 = [answers[i][3:].strip() for i in [0, 1, 2, 3] if answers[i]]
+        if q1to4:
+            g_ev = rotate_pick(q1to4, used_genre_ev, fallback=q1to4[0])
+
+    flavor_candidates = genre_flavors.get(genre, [])
+    flavor = rotate_pick(flavor_candidates, used_flavor, fallback=(flavor_candidates[0] if flavor_candidates else "핵심"))
+
+    template = rotate_pick(reason_templates, used_template, fallback=reason_templates[idx % len(reason_templates)])
+    persona = genre_persona.get(genre, "이런 성향")
+
+    return template.format(s_ev=s_ev, g_ev=g_ev, sit=sit_label, persona=persona, title=title, flavor=flavor)
 
 # =====================================================
-# Sidebar: API key quick test
+# OpenAI (한국어 책만 추천)
 # =====================================================
-st.sidebar.subheader("🔍 국립중앙도서관 API 키 테스트")
-test_query = st.sidebar.text_input("테스트 쿼리(기본: '소설')", value="소설")
-if st.sidebar.button("테스트 호출(1회)"):
-    debug_clear()
-    if not nl_api_key:
-        st.sidebar.error("cert_key가 비어있습니다.")
-    else:
+@st.cache_data(show_spinner=False)
+def call_openai_json(api_key: str, model: str, system: str, user: str) -> dict:
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    payload = {
+        "model": model,
+        "temperature": 0.6,
+        "response_format": {"type": "json_object"},
+        "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+    }
+    r = requests.post(url, headers=headers, json=payload, timeout=30)
+    r.raise_for_status()
+    return json.loads(r.json()["choices"][0]["message"]["content"])
+
+def ai_pick_books_korean_only(answers: List[str], focus_genres: List[str], top_situations: List[str]) -> List[dict]:
+    system = (
+        "너는 한국의 독서 큐레이터다.\n"
+        "반드시 '한국어로 출간/유통되는 책(국내 도서 또는 한국어 번역서)'만 추천해라.\n"
+        "사용자의 설문(성향+상황)을 반영해 3권을 추천하되, 아래 JSON 형식만 출력해라.\n\n"
+        "{\n"
+        '  "recommendations": [\n'
+        '    {"title":"도서명", "author":"저자(모르면 빈 문자열)", "genre":"자기계발|인문/철학|과학/IT|역사/사회|소설"}\n'
+        "  ]\n"
+        "}\n\n"
+        "규칙:\n"
+        "- 반드시 실제로 존재하는 책\n"
+        "- genre는 지정된 5개 중 하나\n"
+        "- focus_genres를 우선 반영하되, 상황(top_situations)도 고려\n"
+        "- 대학생이 읽기 무난한 난이도 우선\n"
+        "- 시/만화/웹툰은 제외\n"
+    )
+    user = (
+        f"focus_genres: {focus_genres}\n"
+        f"top_situations: {top_situations}\n"
+        "사용자 답변:\n" + "\n".join([f"- {a}" for a in answers])
+    )
+    obj = call_openai_json(openai_api_key, openai_model, system, user)
+    recs = obj.get("recommendations", [])
+
+    cleaned = []
+    for r in recs[:5]:  # 여유 있게 받고 3개로 자름
+        title = str(r.get("title", "")).strip()
+        author = str(r.get("author", "")).strip()
+        genre = str(r.get("genre", "")).strip()
+        if genre not in genre_map.values():
+            genre = focus_genres[0] if focus_genres else "소설"
+        if title:
+            cleaned.append({"title": title, "author": author, "genre": genre})
+
+    # 중복 제거
+    uniq = []
+    seen = set()
+    for c in cleaned:
+        if c["title"] in seen:
+            continue
+        seen.add(c["title"])
+        uniq.append(c)
+        if len(uniq) == 3:
+            break
+    return uniq
+
+# =====================================================
+# Networking (fast)
+# =====================================================
+def requests_get(url, params=None, timeout=10, retries=1):
+    last = None
+    for i in range(retries + 1):
         try:
-            raw = nl_search_raw(nl_api_key, test_query, page_no=1, page_size=5,
-                                timeout=nl_timeout, retries=nl_retries, debug=True)
-            items = _extract_items(raw)
-            st.sidebar.success(f"호출 성공 ✅ / 추출 {len(items)}개")
-        except Exception as e:
-            st.sidebar.error(f"호출 실패 ❌: {type(e).__name__}: {e}")
+            return requests.get(url, params=params, timeout=timeout)
+        except (ReadTimeout, ConnectionError) as e:
+            last = e
+            if i == retries:
+                raise
+            time.sleep(0.4 * (2**i))
+    raise last
+
+@st.cache_data(show_spinner=False)
+def nl_isbn_search(cert_key: str, title: str, author: str = "", page_size: int = 5, timeout: int = 10, retries: int = 1):
+    url = "https://www.nl.go.kr/seoji/SearchApi.do"
+    params = {"cert_key": cert_key, "result_style": "json", "page_no": 1, "page_size": page_size, "title": title}
+    if author:
+        params["author"] = author
+    r = requests_get(url, params=params, timeout=timeout, retries=retries)
+    r.raise_for_status()
+    try:
+        return r.json()
+    except Exception:
+        return json.loads(r.text)
+
+def pick_best_item(nl_json, wanted_title: str):
+    items = None
+    if isinstance(nl_json, dict):
+        for k in ["docs", "data", "items", "result"]:
+            if k in nl_json and isinstance(nl_json[k], list):
+                items = nl_json[k]
+                break
+        if items is None:
+            for v in nl_json.values():
+                if isinstance(v, list) and v and isinstance(v[0], dict):
+                    items = v
+                    break
+    if not items:
+        return None
+
+    wt = wanted_title.replace(" ", "").lower()
+
+    def score(it):
+        t = str(it.get("TITLE", "") or it.get("title", "")).replace(" ", "").lower()
+        if not t:
+            return 0
+        if t == wt:
+            return 100
+        if wt in t or t in wt:
+            return 60
+        return 1
+
+    return sorted(items, key=score, reverse=True)[0]
+
+@st.cache_data(show_spinner=False)
+def fetch_text_from_url(url: str, max_chars: int = 650, timeout: int = 10, retries: int = 0) -> str:
+    if not url:
+        return ""
+    try:
+        r = requests_get(url, params=None, timeout=timeout, retries=retries)
+        r.raise_for_status()
+        text = r.text
+        text = re.sub(r"<script.*?>.*?</script>", " ", text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r"<style.*?>.*?</style>", " ", text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = unescape(text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return (text[:max_chars].rstrip() + "…") if len(text) > max_chars else text
+    except RequestException:
+        return ""
+
+def fetch_one_book_nl(c: dict) -> dict:
+    if not nl_api_key:
+        return {**c, "isbn": "", "cover_url": "", "summary": "", "note": ""}
+
+    try:
+        nl_json = nl_isbn_search(
+            nl_api_key,
+            title=c["title"],
+            author=c.get("author", ""),
+            page_size=5,
+            timeout=nl_timeout,
+            retries=nl_retries,
+        )
+        item = pick_best_item(nl_json, c["title"])
+        if not item:
+            return {**c, "isbn": "", "cover_url": "", "summary": "", "note": "검색 결과가 없어 서지정보를 가져오지 못했어요."}
+
+        isbn = item.get("EA_ISBN") or item.get("ISBN") or item.get("isbn") or ""
+        cover_url = item.get("TITLE_URL") or item.get("cover") or item.get("image") or ""
+
+        summary = ""
+        if fetch_summary_default or st.session_state.summary_loaded:
+            intro_url = item.get("BOOK_INTRODUCTION_URL") or ""
+            summary_url = item.get("BOOK_SUMMARY_URL") or ""
+            summary = fetch_text_from_url(summary_url, timeout=nl_timeout, retries=0)
+            if not summary:
+                summary = fetch_text_from_url(intro_url, timeout=nl_timeout, retries=0)
+
+        return {
+            **c,
+            "title": (item.get("TITLE") or c["title"]).strip(),
+            "author": (item.get("AUTHOR") or c.get("author", "")).strip(),
+            "isbn": str(isbn).strip(),
+            "cover_url": str(cover_url).strip(),
+            "summary": summary.strip(),
+            "note": "",
+        }
+
+    except (ReadTimeout, ConnectionError, HTTPError, RequestException):
+        if demo_mode:
+            return {**c, "isbn": "", "cover_url": "", "summary": "", "note": "API 응답이 느려서(Timeout/오류) 서지정보를 생략했어요."}
+        raise
 
 # =====================================================
 # UI: Questionnaire
@@ -624,7 +470,13 @@ st.subheader("📝 질문에 답해주세요")
 
 for i, q in enumerate(questions):
     st.markdown(f"**{q}**")
-    st.radio(label=f"q{i+1}", options=question_choices[i], key=f"q{i+1}", index=None, label_visibility="collapsed")
+    st.radio(
+        label=f"q{i+1}",
+        options=question_choices[i],
+        key=f"q{i+1}",
+        index=None,
+        label_visibility="collapsed",
+    )
     st.write("")
 
 st.divider()
@@ -643,192 +495,134 @@ if load_summary_clicked:
 # Flow
 # =====================================================
 if clicked:
-    if debug_mode:
-        debug_clear()
-
     answers = [st.session_state[f"q{i+1}"] for i in range(7)]
-
-    st.session_state.result = {
-        "answers": answers,
-        "genre_scores": {},
-        "situation_scores": {},
-        "focus_genres": [],
-        "top_situations": [],
-        "used_queries": [],
-        "pool_count": 0,
-        "used_ai": False,
-        "picked": [],
-        "raw_first_pool_item": None,
-        "error": "",
-        "nl_errors": [],
-    }
-
     if any(a is None for a in answers):
         missing = [str(i + 1) for i, a in enumerate(answers) if a is None]
-        st.session_state.result["error"] = f"모든 질문에 답변해 주세요! (미응답: {', '.join(missing)}번)"
-        st.session_state.submitted = True
-    elif not nl_api_key:
-        st.session_state.result["error"] = "국립중앙도서관 API 키(cert_key)가 필요합니다. 사이드바에 입력해 주세요."
-        st.session_state.submitted = True
+        st.warning(f"모든 질문에 답변해 주세요! (미응답: {', '.join(missing)}번)")
     else:
-        with st.spinner("분석 + 후보 리스트 가져오는 중..."):
-            try:
-                genre_scores = compute_genre_scores(answers)
-                situation_scores = compute_situation_scores(answers)
+        with st.spinner("분석 중..."):
+            genre_scores = compute_genre_scores(answers)
+            top_genres, second_genres, _ = top_keys(genre_scores)
 
-                focus_genres = top_two(genre_scores)
-                top_situations = top_list(situation_scores)
+            situation_scores = compute_situation_scores(answers)
+            top_situations, _, _ = top_keys(situation_scores)
 
-                pool, used_queries, nl_errors = fetch_candidate_pool_from_nl(
-                    cert_key=nl_api_key,
-                    focus_genres=focus_genres,
-                    top_situations=top_situations,
-                    target_pool_size=pool_size,
-                    timeout=nl_timeout,
-                    retries=nl_retries,
-                    debug=debug_mode,
-                )
+            # focus: 최대 2개 장르
+            focus_genres = top_genres[:2] if len(top_genres) >= 2 else (top_genres + second_genres[:1])
 
-                st.session_state.result.update({
-                    "genre_scores": genre_scores,
-                    "situation_scores": situation_scores,
-                    "focus_genres": focus_genres,
-                    "top_situations": top_situations,
-                    "used_queries": used_queries,
-                    "pool_count": len(pool),
-                    "raw_first_pool_item": pool[0].get("raw") if pool else None,
-                    "nl_errors": nl_errors,
-                })
-
-                if not pool:
-                    # 후보 0개일 때도 디버그 힌트를 UI로 더 보여주기
-                    hint = "후보를 가져오지 못했어요. (키/네트워크/쿼리 문제 가능)"
-                    if debug_mode and nl_errors:
-                        hint += f"\n\n디버그: 쿼리별 실패 {len(nl_errors)}건 (아래 로그 확인)"
-                    st.session_state.result["error"] = hint
-                else:
-                    picked = []
+            # 1) AI 추천(가능하면)
+            candidates: List[dict] = []
+            used_ai = False
+            if openai_api_key:
+                try:
+                    ai_recs = ai_pick_books_korean_only(answers, focus_genres=focus_genres, top_situations=top_situations)
+                    if len(ai_recs) == 3:
+                        candidates = ai_recs
+                        used_ai = True
+                except Exception:
+                    candidates = []
                     used_ai = False
-                    if openai_api_key:
-                        try:
-                            picked = ai_choose_from_pool(answers, focus_genres, top_situations, pool, openai_api_key, openai_model)
-                            if len(picked) == 3:
-                                used_ai = True
-                            else:
-                                picked = fallback_choose_from_pool(pool)
-                                used_ai = False
-                        except Exception:
-                            if debug_mode:
-                                debug_log("openai_choose_failed", traceback=traceback.format_exc())
-                            picked = fallback_choose_from_pool(pool)
-                            used_ai = False
-                    else:
-                        picked = fallback_choose_from_pool(pool)
-                        used_ai = False
 
-                    # 줄거리 로딩
-                    if fetch_summary_default or st.session_state.summary_loaded:
-                        for b in picked:
-                            b["summary"] = get_summary_for_book(b)
-                    else:
-                        for b in picked:
-                            b["summary"] = ""
+            # 2) 실패/미입력 시 fallback
+            if len(candidates) < 3:
+                fb = pick_3_books(top_genres, second_genres)
+                candidates = [{"title": b["title"], "author": b.get("author", ""), "genre": b["genre"]} for b in fb]
+                used_ai = False
 
-                    primary_genre = focus_genres[0] if focus_genres else "소설"
-                    st.session_state["_used_genre_ev"] = set()
-                    st.session_state["_used_sit_ev"] = set()
-                    st.session_state["_used_flavor"] = set()
-                    st.session_state["_used_tmpl"] = set()
+            # ✅ 책마다 이유가 다르게 생성
+            used_genre_ev, used_sit_ev, used_flavor, used_template = set(), set(), set(), set()
+            enriched = []
+            for idx, c in enumerate(candidates[:3]):
+                why = build_reason_diversified(
+                    answers=answers,
+                    title=c["title"],
+                    genre=c["genre"],
+                    top_situations=top_situations,
+                    idx=idx,
+                    used_genre_ev=used_genre_ev,
+                    used_sit_ev=used_sit_ev,
+                    used_flavor=used_flavor,
+                    used_template=used_template,
+                )
+                enriched.append({**c, "why": why})
 
-                    for idx, b in enumerate(picked):
-                        b["genre"] = primary_genre
-                        b["why"] = build_reason(answers, primary_genre, top_situations, idx, b)
+            # ✅ 병렬로 3권 조회 (표지/ISBN 우선)
+            books_final = []
+            used_nl = False
+            if nl_api_key:
+                used_nl = True
+                with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                    futures = [ex.submit(fetch_one_book_nl, c) for c in enriched]
+                    for f in as_completed(futures):
+                        books_final.append(f.result())
+                # 추천 순서 유지(원래 리스트 기준) - title 기반으로 정렬
+                order = {b["title"]: i for i, b in enumerate(enriched)}
+                books_final.sort(key=lambda x: order.get(x["title"], 999))
+            else:
+                books_final = [{**c, "isbn": "", "cover_url": "", "summary": "", "note": ""} for c in enriched]
 
-                    st.session_state.result.update({
-                        "picked": picked,
-                        "used_ai": used_ai,
-                    })
-            except Exception as e:
-                # 전체 플로우 레벨 예외도 잡아서 디버그 로그에 남김
-                if debug_mode:
-                    debug_log("flow_exception", error=str(e), type=type(e).__name__, traceback=traceback.format_exc())
-                st.session_state.result["error"] = f"처리 중 예외가 발생했습니다: {type(e).__name__}: {e}"
-
-        st.session_state.submitted = True
+            st.session_state.submitted = True
+            st.session_state.result = {
+                "genre_scores": genre_scores,
+                "genre_top": top_genres,
+                "situation_scores": situation_scores,
+                "situation_top": top_situations,
+                "books": books_final,
+                "answers": answers,
+                "used_ai": used_ai,
+                "used_nl": used_nl,
+            }
 
 # =====================================================
 # Render
 # =====================================================
 if st.session_state.submitted and st.session_state.result:
     r = st.session_state.result
+    st.subheader("📌 분석 결과")
 
-    if r.get("error"):
-        st.error(r["error"])
+    st.success(f"독서 성향: {', '.join(r['genre_top'])}")
+    sit_text = ", ".join([tag_display.get(t, t) for t in r["situation_top"]])
+    st.info(f"현재 필요한 것: **{sit_text}**")
 
-        # 디버그 모드면, 실패 원인을 바로 볼 수 있게 로그 표시
-        if debug_mode and debug_show_logs:
-            with st.expander("🧪 디버그 로그(실패 원인 추적)"):
-                _ensure_debug_state()
-                st.write(f"- 로그 개수: {len(st.session_state._debug_logs)}")
-                if r.get("nl_errors"):
-                    st.write("**쿼리별 에러 요약**")
-                    st.json(r["nl_errors"])
-                st.write("**상세 로그**")
-                st.json(st.session_state._debug_logs)
-
+    if r.get("used_ai"):
+        st.caption("✅ OpenAI를 사용해 '한국어로 출간/유통되는 책' 3권을 추천했습니다.")
     else:
-        st.subheader("📌 분석 결과")
-        focus_genres = r.get("focus_genres", [])
-        top_situations = r.get("top_situations", [])
+        st.caption("ℹ️ OpenAI 미사용/실패로 데모 추천 목록을 사용했습니다.")
 
-        st.success(f"독서 성향(상위): {', '.join(focus_genres) if focus_genres else '—'}")
-        sit_text = ", ".join([tag_display.get(t, t) for t in top_situations]) if top_situations else "—"
-        st.info(f"현재 필요한 것(상위): **{sit_text}**")
+    if r.get("used_nl"):
+        st.caption("※ 속도 개선: 기본은 표지/ISBN만 조회합니다. 줄거리는 ‘줄거리 불러오기’ 버튼으로 지연 로딩하세요.")
+    else:
+        st.warning("국립중앙도서관 API 키가 없어서 표지/ISBN/줄거리는 표시되지 않습니다.")
 
-        used_queries = r.get("used_queries", [])
-        st.caption(f"국립중앙도서관 검색 키워드: {', '.join(used_queries) if used_queries else '—'} · 후보 {r.get('pool_count',0)}권 확보")
+    st.subheader("📚 추천 도서 3권")
+    for idx, b in enumerate(r["books"], start=1):
+        st.markdown(f"### {idx}. {b['title']}")
+        meta = []
+        if b.get("author"):
+            meta.append(f"저자: {b['author']}")
+        if b.get("isbn"):
+            meta.append(f"ISBN: {b['isbn']}")
+        if meta:
+            st.caption(" · ".join(meta))
 
-        if r.get("used_ai"):
-            st.caption("✅ AI가 후보 리스트 중에서 3권을 선택했습니다.")
-        else:
-            st.caption("ℹ️ AI 미사용/실패로 규칙 기반 선택을 사용했습니다.")
+        cols = st.columns([1, 2])
+        with cols[0]:
+            if b.get("cover_url"):
+                st.image(b["cover_url"], use_container_width=True)
+            else:
+                st.info("표지 없음/조회 실패")
 
-        if debug_show_raw and r.get("raw_first_pool_item"):
-            with st.expander("🧪 후보 1개 raw JSON"):
-                st.json(r["raw_first_pool_item"])
+        with cols[1]:
+            st.write("**추천 이유(책마다 다르게 생성됨)**")
+            st.write(f"- {b.get('why', '')}")
 
-        # 성공 시에도 원하면 디버그 로그 표시
-        if debug_mode and debug_show_logs:
-            with st.expander("🧪 디버그 로그(성공했지만 확인용)"):
-                _ensure_debug_state()
-                st.json(st.session_state._debug_logs)
+            st.write("**줄거리/책소개**")
+            if b.get("summary"):
+                st.write(b["summary"])
+            else:
+                st.info("줄거리 미로딩(버튼으로 불러올 수 있어요) 또는 제공 URL 없음/실패")
 
-        st.subheader("📚 추천 도서 3권")
-        for i, b in enumerate(r.get("picked", []), start=1):
-            st.markdown(f"### {i}. {b.get('title','')}")
-            meta = []
-            if b.get("author"): meta.append(f"저자: {b['author']}")
-            if b.get("publisher"): meta.append(f"출판사: {b['publisher']}")
-            if b.get("pub_year"): meta.append(f"발행: {b['pub_year']}")
-            if b.get("isbn"): meta.append(f"ISBN: {b['isbn']}")
-            if meta:
-                st.caption(" · ".join(meta))
+            if b.get("note"):
+                st.warning(b["note"])
 
-            cols = st.columns([1, 2])
-            with cols[0]:
-                if b.get("cover_url"):
-                    st.image(b["cover_url"], use_container_width=True)
-                else:
-                    st.info("표지 이미지 없음(데이터 미제공)")
-
-            with cols[1]:
-                st.write("**추천 이유(설문 근거 + 책별 포인트)**")
-                st.write(f"- {b.get('why','')}")
-
-                st.write("**줄거리/책소개**")
-                if b.get("summary"):
-                    st.write(b["summary"])
-                else:
-                    st.info("줄거리 미로딩(‘줄거리 불러오기’ 버튼으로 지연 로딩) 또는 제공 URL 없음")
-
-            st.divider()
+        st.divider()
