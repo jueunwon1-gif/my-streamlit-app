@@ -1,10 +1,13 @@
 import json
 import random
 import re
+import time
 from html import unescape
+from typing import Optional, Dict, Any, List, Tuple
 
 import requests
 import streamlit as st
+from requests.exceptions import ReadTimeout, ConnectionError, HTTPError, RequestException
 
 st.set_page_config(page_title="나와 어울리는 책은?", page_icon="📚", layout="centered")
 
@@ -27,9 +30,27 @@ openai_api_key = st.sidebar.text_input(
 openai_model = st.sidebar.text_input("OpenAI 모델", value="gpt-4o-mini")
 
 demo_mode = st.sidebar.checkbox(
-    "데모 모드(국립중앙도서관 API 없이도 결과 보기)",
+    "데모 모드(국립중앙도서관 API가 느리거나 실패해도 결과 보기)",
     value=True,
-    help="API Key가 없어도 장르 분석 + 추천 3권 + 개인화 이유(설문 근거)를 확인할 수 있습니다.",
+    help="API 호출이 타임아웃/실패해도 추천/이유는 먼저 보여주고, 서지정보(표지/ISBN/줄거리)는 가능한 것만 표시합니다.",
+)
+
+st.sidebar.subheader("⏱️ 네트워크 옵션")
+nl_timeout = st.sidebar.slider(
+    "국립중앙도서관 API 타임아웃(초)",
+    min_value=10,
+    max_value=60,
+    value=45,
+    step=5,
+    help="Streamlit Cloud 환경에서 30초는 종종 부족해요. 45~60초 권장.",
+)
+nl_retries = st.sidebar.slider(
+    "재시도 횟수",
+    min_value=0,
+    max_value=3,
+    value=2,
+    step=1,
+    help="ReadTimeout 발생 시 재시도합니다. (지수 백오프 적용)",
 )
 
 # =====================================================
@@ -40,13 +61,11 @@ st.write(
     "7문항 심리테스트로 **성향(장르 취향)**과 **현재 상황(무엇이 필요한지)**을 함께 파악해 "
     "당신에게 맞는 책 3권을 추천해드립니다.\n\n"
     "- 국립중앙도서관 API 키가 있으면: **표지/ISBN/소개**까지 실제 데이터로 표시\n"
-    "- 없으면(데모 모드): 추천/이유 중심으로 먼저 확인 가능"
+    "- API가 느리거나 실패하면: **추천/이유는 먼저**, 서지정보는 가능한 것만 표시"
 )
 
 # =====================================================
-# New Questionnaire (성향 + 상황) - 7개 유지
-#   - Q1~Q4: 성향 중심
-#   - Q5~Q7: 상황 중심
+# Questionnaire (성향 + 상황) - 7개 유지
 # =====================================================
 questions = [
     "1) 새로운 책을 고를 때 가장 끌리는 요소는?",
@@ -111,7 +130,7 @@ question_choices = [
 ]
 
 # =====================================================
-# Genre / Persona / "Book point" (⚠️ 에러 원인: genre_book_point가 누락되었음)
+# Mappings
 # =====================================================
 genre_map = {"A": "자기계발", "B": "인문/철학", "C": "과학/IT", "D": "역사/사회", "E": "소설"}
 
@@ -123,7 +142,6 @@ genre_persona = {
     "소설": "감정·분위기·서사 몰입을 통해 회복하는 감성형",
 }
 
-# ✅ 누락되어 NameError가 났던 변수: 반드시 정의
 genre_book_point = {
     "자기계발": "바로 적용 가능한 습관·실행 포인트",
     "인문/철학": "감정과 생각을 정리해주는 통찰",
@@ -132,39 +150,13 @@ genre_book_point = {
     "소설": "감정적으로 몰입하며 위로와 여운을 주는 서사",
 }
 
-# =====================================================
-# 상황 태그(위로/휴식/동기/탐구) 점수화: Q5~Q7 기준
-# =====================================================
 situation_tag_map_q5_to_q7 = {
-    5: {
-        "A": ["동기"],
-        "B": ["위로"],
-        "C": ["탐구"],
-        "D": ["탐구"],
-        "E": ["위로", "휴식"],
-    },
-    6: {
-        "A": ["동기"],
-        "B": ["위로"],
-        "C": ["탐구"],
-        "D": ["탐구"],
-        "E": ["휴식", "위로"],
-    },
-    7: {
-        "A": ["동기"],
-        "B": ["위로"],
-        "C": ["탐구"],
-        "D": ["탐구"],
-        "E": ["휴식", "위로"],
-    },
+    5: {"A": ["동기"], "B": ["위로"], "C": ["탐구"], "D": ["탐구"], "E": ["위로", "휴식"]},
+    6: {"A": ["동기"], "B": ["위로"], "C": ["탐구"], "D": ["탐구"], "E": ["휴식", "위로"]},
+    7: {"A": ["동기"], "B": ["위로"], "C": ["탐구"], "D": ["탐구"], "E": ["휴식", "위로"]},
 }
 
-tag_display = {
-    "동기": "방향/동기부여",
-    "위로": "감정 정리/위로",
-    "휴식": "휴식/회복",
-    "탐구": "호기심/탐구",
-}
+tag_display = {"동기": "방향/동기부여", "위로": "감정 정리/위로", "휴식": "휴식/회복", "탐구": "호기심/탐구"}
 
 # =====================================================
 # Demo fallback pool
@@ -216,9 +208,9 @@ if "result" not in st.session_state:
     st.session_state.result = None
 
 for i in range(7):
-    key = f"q{i+1}"
-    if key not in st.session_state:
-        st.session_state[key] = None
+    k = f"q{i+1}"
+    if k not in st.session_state:
+        st.session_state[k] = None
 
 
 def reset_test():
@@ -229,57 +221,51 @@ def reset_test():
 
 
 # =====================================================
-# Helpers: scoring
+# Helpers
 # =====================================================
 def letter_of(answer: str) -> str:
     return answer.strip()[0]
 
 
-def compute_genre_scores(answers):
+def compute_genre_scores(answers: List[str]) -> Dict[str, int]:
     scores = {g: 0 for g in genre_map.values()}
     for ans in answers:
         scores[genre_map[letter_of(ans)]] += 1
     return scores
 
 
-def compute_situation_scores(answers):
+def compute_situation_scores(answers: List[str]) -> Dict[str, int]:
     tags = {"위로": 0, "휴식": 0, "동기": 0, "탐구": 0}
     for qno in [5, 6, 7]:
-        ans = answers[qno - 1]
-        letter = letter_of(ans)
+        letter = letter_of(answers[qno - 1])
         for t in situation_tag_map_q5_to_q7[qno].get(letter, []):
             tags[t] += 1
     return tags
 
 
-def get_ranked(scores: dict):
+def ranked(scores: Dict[str, int]) -> List[Tuple[str, int]]:
     return sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
 
-def top_keys(scores: dict):
-    ranked = get_ranked(scores)
-    max_score = ranked[0][1]
-    top = [k for k, v in ranked if v == max_score]
-
+def top_keys(scores: Dict[str, int]):
+    r = ranked(scores)
+    max_score = r[0][1]
+    top = [k for k, v in r if v == max_score]
     second_score = None
-    for k, v in ranked:
+    for k, v in r:
         if v < max_score:
             second_score = v
             break
-    second = [k for k, v in ranked if second_score is not None and v == second_score]
-    return top, second, ranked
+    second = [k for k, v in r if second_score is not None and v == second_score]
+    return top, second, r
 
 
-# =====================================================
-# Recommend 3 books (demo)
-# =====================================================
 def pick_3_books(primary_genres, secondary_genres):
     if len(primary_genres) >= 2:
         pool = []
         for g in primary_genres:
             pool += [{"genre": g, **b} for b in fallback_pool[g]]
         random.shuffle(pool)
-
         books, seen = [], set()
         for item in pool:
             if item["title"] in seen:
@@ -302,17 +288,9 @@ def pick_3_books(primary_genres, secondary_genres):
     return [{"genre": primary, **b} for b in random.sample(fallback_pool[primary], k=3)]
 
 
-# =====================================================
-# Evidence-based 이유 생성 (성향 + 상황 반영)
-# =====================================================
 def evidence_by_genre(answers, target_genre, max_evidence=2):
-    target_letter = None
-    for letter, g in genre_map.items():
-        if g == target_genre:
-            target_letter = letter
-            break
-
-    matched = [a for a in answers if letter_of(a) == target_letter]
+    target_letter = next((l for l, g in genre_map.items() if g == target_genre), None)
+    matched = [a for a in answers if target_letter and letter_of(a) == target_letter]
     cleaned = [m[3:].strip() if len(m) > 3 else m.strip() for m in matched]
     random.shuffle(cleaned)
     return cleaned[:max_evidence]
@@ -326,7 +304,6 @@ def evidence_by_situation(answers, top_situation_tags, max_evidence=1):
         tags = situation_tag_map_q5_to_q7[qno].get(letter, [])
         if any(t in top_situation_tags for t in tags):
             evidences.append(ans[3:].strip() if len(ans) > 3 else ans.strip())
-
     random.shuffle(evidences)
     return evidences[:max_evidence]
 
@@ -358,66 +335,46 @@ def build_reason(answers, book_title, book_genre, top_situation_tags):
 
 
 # =====================================================
-# OpenAI: optional book candidate generation (title/author/genre only)
+# Robust HTTP utilities (timeout/retry/backoff)
+# =====================================================
+def requests_get_with_retry(
+    url: str,
+    params: Optional[dict] = None,
+    timeout: int = 45,
+    retries: int = 2,
+    backoff_base: float = 0.8,
+    headers: Optional[dict] = None,
+) -> requests.Response:
+    """
+    ReadTimeout/ConnectionError 등 네트워크 이슈에 대해 재시도(지수 백오프).
+    Streamlit Cloud에서 간헐적으로 발생하는 ReadTimeout 완화.
+    """
+    last_err: Optional[Exception] = None
+    for attempt in range(retries + 1):
+        try:
+            return requests.get(url, params=params, headers=headers, timeout=timeout)
+        except (ReadTimeout, ConnectionError) as e:
+            last_err = e
+            if attempt == retries:
+                raise
+            sleep_s = backoff_base * (2 ** attempt) + random.uniform(0, 0.2)
+            time.sleep(sleep_s)
+        except RequestException as e:
+            # 기타 requests 예외는 그대로 올리되, 한 번 정도는 재시도해볼 수도 있음
+            last_err = e
+            if attempt == retries:
+                raise
+            sleep_s = backoff_base * (2 ** attempt) + random.uniform(0, 0.2)
+            time.sleep(sleep_s)
+    # 이 라인엔 보통 도달하지 않음
+    raise last_err if last_err else RuntimeError("Unknown network error")
+
+
+# =====================================================
+# National Library API calls (with retry)
 # =====================================================
 @st.cache_data(show_spinner=False)
-def call_openai_json(api_key: str, model: str, system: str, user: str) -> dict:
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    payload = {
-        "model": model,
-        "temperature": 0.7,
-        "response_format": {"type": "json_object"},
-        "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-    }
-    r = requests.post(url, headers=headers, json=payload, timeout=30)
-    r.raise_for_status()
-    return json.loads(r.json()["choices"][0]["message"]["content"])
-
-
-def ai_pick_books(answers, focus_genres):
-    system = (
-        "너는 한국어 독서 큐레이터다. 사용자의 설문 응답(성향+상황)을 바탕으로 "
-        "실제로 존재하는 책 3권을 추천하되, 아래 JSON 형식으로만 응답하라.\n\n"
-        "{\n"
-        '  "recommendations": [\n'
-        '    {"title":"도서명", "author":"저자(모르면 빈 문자열)", "genre":"자기계발|인문/철학|과학/IT|역사/사회|소설"}\n'
-        "  ]\n"
-        "}\n\n"
-        "규칙:\n"
-        "- focus_genres에 최대한 맞춰 추천\n"
-        "- 대학생이 읽기 무난한 난이도 우선\n"
-        "- 도서명은 실제 존재 책\n"
-        "- genre는 반드시 5개 중 하나\n"
-    )
-    user = (
-        f"focus_genres: {focus_genres}\n"
-        "사용자 답변(원문):\n"
-        + "\n".join([f"- {a}" for a in answers])
-        + "\n\n"
-        "추천 JSON을 만들어줘."
-    )
-    obj = call_openai_json(openai_api_key, openai_model, system, user)
-    recs = obj.get("recommendations", [])[:3]
-
-    cleaned = []
-    for r in recs:
-        title = str(r.get("title", "")).strip()
-        author = str(r.get("author", "")).strip()
-        genre = str(r.get("genre", "")).strip()
-        if genre not in genre_map.values():
-            genre = focus_genres[0]
-        if title:
-            cleaned.append({"title": title, "author": author, "genre": genre})
-
-    return cleaned[:3]
-
-
-# =====================================================
-# National Library (ISBN 서지정보) API helpers
-# =====================================================
-@st.cache_data(show_spinner=False)
-def nl_isbn_search(cert_key: str, title: str, author: str = "", page_size: int = 10):
+def nl_isbn_search(cert_key: str, title: str, author: str = "", page_size: int = 10, timeout: int = 45, retries: int = 2):
     url = "https://www.nl.go.kr/seoji/SearchApi.do"
     params = {
         "cert_key": cert_key,
@@ -429,8 +386,9 @@ def nl_isbn_search(cert_key: str, title: str, author: str = "", page_size: int =
     if author:
         params["author"] = author
 
-    r = requests.get(url, params=params, timeout=30)
+    r = requests_get_with_retry(url, params=params, timeout=timeout, retries=retries)
     r.raise_for_status()
+
     try:
         return r.json()
     except Exception:
@@ -468,11 +426,12 @@ def pick_best_item(nl_json, wanted_title: str):
     return sorted(items, key=score, reverse=True)[0]
 
 
-def fetch_text_from_url(url: str, max_chars: int = 700):
+@st.cache_data(show_spinner=False)
+def fetch_text_from_url(url: str, max_chars: int = 700, timeout: int = 30, retries: int = 1) -> str:
     if not url:
         return ""
     try:
-        r = requests.get(url, timeout=30)
+        r = requests_get_with_retry(url, params=None, timeout=timeout, retries=retries)
         r.raise_for_status()
         text = r.text
 
@@ -485,7 +444,7 @@ def fetch_text_from_url(url: str, max_chars: int = 700):
         if len(text) > max_chars:
             text = text[:max_chars].rstrip() + "…"
         return text
-    except Exception:
+    except RequestException:
         return ""
 
 
@@ -507,7 +466,6 @@ for i, q in enumerate(questions):
     st.write("")
 
 st.divider()
-
 c1, c2 = st.columns(2)
 with c1:
     clicked = st.button("결과 보기", type="primary")
@@ -524,83 +482,101 @@ if clicked:
         st.warning(f"모든 질문에 답변해 주세요! (미응답: {', '.join(missing)}번)")
     else:
         with st.spinner("분석 중..."):
-            # 1) 성향(장르)
+            # 성향/상황 분석
             genre_scores = compute_genre_scores(answers)
             top_genres, second_genres, genre_ranked = top_keys(genre_scores)
 
-            # 2) 상황 태그
             situation_scores = compute_situation_scores(answers)
-            top_situations, second_situations, situation_ranked = top_keys(situation_scores)
+            top_situations, _, situation_ranked = top_keys(situation_scores)
 
-            focus_genres = (top_genres[:2] if len(top_genres) >= 2 else top_genres + second_genres[:1]) or top_genres
+            # 책 후보(데모) 3권
+            candidates = pick_3_books(top_genres, second_genres)
+            candidates = [{"title": b["title"], "author": b.get("author", ""), "genre": b["genre"]} for b in candidates]
 
-            # 3) 책 후보 3권
-            if openai_api_key:
-                candidates = ai_pick_books(answers, focus_genres=focus_genres)
-                if len(candidates) < 3:
-                    fill = pick_3_books(top_genres, second_genres)
-                    for f in fill:
-                        if len(candidates) >= 3:
-                            break
-                        candidates.append({"title": f["title"], "author": f.get("author", ""), "genre": f["genre"]})
-            else:
-                fill = pick_3_books(top_genres, second_genres)
-                candidates = [{"title": b["title"], "author": b.get("author", ""), "genre": b["genre"]} for b in fill]
-
-            # 4) 추천 이유 생성 (설문 근거 + 상황 기반)
+            # 개인화 추천 이유 생성
             enriched = []
             for c in candidates[:3]:
                 why = build_reason(answers, c["title"], c["genre"], top_situations)
                 enriched.append({**c, "why": why})
 
-            # 5) 국립중앙도서관 API로 실제 정보 (가능할 때)
+            # 국립중앙도서관 API로 실제 정보 조회(가능하면)
             books_final = []
-            can_fetch_nl = bool(nl_api_key)
-
-            if can_fetch_nl:
+            used_nl = False
+            if nl_api_key:
+                used_nl = True
                 for c in enriched:
-                    title = c["title"]
-                    author = c.get("author", "")
-
-                    nl_json = nl_isbn_search(nl_api_key, title=title, author=author, page_size=10)
-                    item = pick_best_item(nl_json, wanted_title=title)
-
-                    if not item:
-                        books_final.append(
-                            {**c, "isbn": "", "cover_url": "", "summary": "", "note": "국립중앙도서관에서 일치하는 도서를 찾지 못했어요."}
+                    try:
+                        nl_json = nl_isbn_search(
+                            nl_api_key,
+                            title=c["title"],
+                            author=c.get("author", ""),
+                            page_size=10,
+                            timeout=nl_timeout,
+                            retries=nl_retries,
                         )
-                        continue
+                        item = pick_best_item(nl_json, wanted_title=c["title"])
 
-                    picked_title = item.get("TITLE") or item.get("title") or title
-                    picked_author = item.get("AUTHOR") or item.get("author") or author
-                    isbn = item.get("EA_ISBN") or item.get("ISBN") or item.get("isbn") or ""
+                        if not item:
+                            books_final.append(
+                                {**c, "isbn": "", "cover_url": "", "summary": "", "note": "검색 결과가 없어서 서지정보를 가져오지 못했어요."}
+                            )
+                            continue
 
-                    cover_url = item.get("TITLE_URL") or item.get("cover") or item.get("image") or ""
-                    intro_url = item.get("BOOK_INTRODUCTION_URL") or ""
-                    summary_url = item.get("BOOK_SUMMARY_URL") or ""
+                        picked_title = item.get("TITLE") or item.get("title") or c["title"]
+                        picked_author = item.get("AUTHOR") or item.get("author") or c.get("author", "")
+                        isbn = item.get("EA_ISBN") or item.get("ISBN") or item.get("isbn") or ""
 
-                    summary_text = fetch_text_from_url(summary_url)
-                    if not summary_text:
-                        summary_text = fetch_text_from_url(intro_url)
+                        cover_url = item.get("TITLE_URL") or item.get("cover") or item.get("image") or ""
+                        intro_url = item.get("BOOK_INTRODUCTION_URL") or ""
+                        summary_url = item.get("BOOK_SUMMARY_URL") or ""
 
-                    books_final.append(
-                        {
-                            **c,
-                            "title": str(picked_title).strip(),
-                            "author": str(picked_author).strip(),
-                            "isbn": str(isbn).strip(),
-                            "cover_url": str(cover_url).strip(),
-                            "summary": summary_text.strip(),
-                            "note": "",
-                        }
-                    )
+                        summary_text = fetch_text_from_url(summary_url, timeout=nl_timeout, retries=1)
+                        if not summary_text:
+                            summary_text = fetch_text_from_url(intro_url, timeout=nl_timeout, retries=1)
+
+                        books_final.append(
+                            {
+                                **c,
+                                "title": str(picked_title).strip(),
+                                "author": str(picked_author).strip(),
+                                "isbn": str(isbn).strip(),
+                                "cover_url": str(cover_url).strip(),
+                                "summary": summary_text.strip(),
+                                "note": "",
+                            }
+                        )
+
+                    except ReadTimeout:
+                        # ✅ 핵심: 타임아웃 나도 앱이 죽지 않게 처리
+                        if demo_mode:
+                            books_final.append(
+                                {
+                                    **c,
+                                    "isbn": "",
+                                    "cover_url": "",
+                                    "summary": "",
+                                    "note": "국립중앙도서관 API 응답이 지연되어(Timeout) 서지정보를 생략했어요. 잠시 후 다시 시도해보세요.",
+                                }
+                            )
+                        else:
+                            raise
+                    except (HTTPError, ConnectionError, RequestException):
+                        if demo_mode:
+                            books_final.append(
+                                {
+                                    **c,
+                                    "isbn": "",
+                                    "cover_url": "",
+                                    "summary": "",
+                                    "note": "국립중앙도서관 API 호출에 실패하여 서지정보를 생략했어요. 잠시 후 다시 시도해보세요.",
+                                }
+                            )
+                        else:
+                            raise
             else:
-                if demo_mode:
-                    for c in enriched:
-                        books_final.append({**c, "isbn": "", "cover_url": "", "summary": "", "note": ""})
-                else:
-                    st.error("국립중앙도서관 API 키(cert_key)가 필요합니다. 사이드바에 입력해 주세요.")
-                    st.stop()
+                # 키가 없으면(데모 모드든 아니든) 추천/이유까지만
+                for c in enriched:
+                    books_final.append({**c, "isbn": "", "cover_url": "", "summary": "", "note": ""})
 
             st.session_state.submitted = True
             st.session_state.result = {
@@ -610,10 +586,8 @@ if clicked:
                 "situation_scores": situation_scores,
                 "situation_top": top_situations,
                 "situation_ranked": situation_ranked,
-                "focus_genres": focus_genres,
-                "used_openai": bool(openai_api_key),
-                "used_nl": can_fetch_nl,
                 "books": books_final,
+                "used_nl": used_nl,
             }
 
 # =====================================================
@@ -629,17 +603,16 @@ if st.session_state.submitted and st.session_state.result:
     else:
         st.success(f"당신의 **독서 성향**: {r['genre_top'][0]}")
 
-    top_sit = r["situation_top"]
-    sit_text = ", ".join([tag_display.get(t, t) for t in top_sit])
+    sit_text = ", ".join([tag_display.get(t, t) for t in r["situation_top"]])
     st.info(f"현재 당신에게 가장 필요한 것: **{sit_text}**")
 
     st.caption("장르 점수: " + ", ".join([f"{k} {v}" for k, v in r["genre_scores"].items()]))
     st.caption("상황 점수: " + ", ".join([f"{tag_display.get(k,k)} {v}" for k, v in r["situation_scores"].items()]))
 
-    if not r["used_openai"]:
-        st.info("OpenAI 키가 없어 **데모 추천 목록**으로 도서를 골랐습니다. (추천 이유는 설문 답변 근거 기반)")
-    if not r["used_nl"]:
-        st.warning("국립중앙도서관 API 키가 없어 **표지/ISBN/줄거리**는 표시되지 않습니다. (데모 모드)")
+    if r["used_nl"]:
+        st.caption("※ 국립중앙도서관 API는 트래픽/네트워크 상태에 따라 응답이 지연될 수 있어요. (타임아웃 시 자동으로 일부 생략)")
+    else:
+        st.warning("국립중앙도서관 API 키가 없어서 **표지/ISBN/줄거리**는 표시되지 않습니다. (추천/이유는 정상 표시)")
 
     st.subheader("📚 추천 도서 3권")
     for idx, b in enumerate(r["books"], start=1):
@@ -657,7 +630,7 @@ if st.session_state.submitted and st.session_state.result:
             if b.get("cover_url"):
                 st.image(b["cover_url"], use_container_width=True)
             else:
-                st.info("표지 이미지 없음(데모/검색 실패)")
+                st.info("표지 이미지 없음(데모/검색 실패/Timeout)")
 
         with cols[1]:
             st.write("**이 책을 추천하는 이유(설문 근거 + 상황 기반)**")
@@ -667,7 +640,7 @@ if st.session_state.submitted and st.session_state.result:
             if b.get("summary"):
                 st.write(b["summary"])
             else:
-                st.info("줄거리/책소개 정보를 아직 가져오지 못했어요. (API 키 필요 또는 제공 URL 없음)")
+                st.info("줄거리/책소개 정보를 가져오지 못했어요. (제공 URL 없음/Timeout)")
 
             if b.get("note"):
                 st.warning(b["note"])
