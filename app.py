@@ -13,6 +13,51 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 st.set_page_config(page_title="나와 어울리는 책은?", page_icon="📚", layout="centered")
 
 # =====================================================
+# Global UI Style (깔끔 카드 UI)
+# =====================================================
+st.markdown(
+    """
+    <style>
+      .block-container { padding-top: 2rem; padding-bottom: 2rem; max-width: 860px; }
+      .small-muted { color: rgba(0,0,0,.55); font-size: 0.9rem; margin-top: .2rem; }
+      .result-card {
+        border: 1px solid rgba(0,0,0,.08);
+        border-radius: 18px;
+        padding: 18px 18px;
+        background: rgba(255,255,255,.65);
+        box-shadow: 0 8px 22px rgba(0,0,0,.06);
+        margin: 14px 0 18px 0;
+      }
+      .pill {
+        display:inline-block;
+        padding: 6px 10px;
+        border-radius: 999px;
+        border: 1px solid rgba(0,0,0,.08);
+        background: rgba(0,0,0,.03);
+        font-size: 0.82rem;
+        margin-right: 6px;
+        margin-bottom: 6px;
+      }
+      .title-row { display:flex; gap:10px; align-items: baseline; flex-wrap: wrap; }
+      .book-title { font-size: 1.15rem; font-weight: 800; margin: 0; }
+      .book-meta { color: rgba(0,0,0,.62); font-size: 0.92rem; margin: 0.2rem 0 0 0; }
+      .why-box {
+        border-radius: 14px;
+        padding: 12px 14px;
+        border: 1px solid rgba(0,0,0,.08);
+        background: rgba(255,255,255,.75);
+        margin-top: 10px;
+      }
+      .why-label { font-weight: 700; margin-bottom: 6px; }
+      .divider-soft { height: 1px; background: rgba(0,0,0,.06); margin: 14px 0; }
+      /* expander header */
+      .stExpander summary { font-weight: 700; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# =====================================================
 # Sidebar
 # =====================================================
 st.sidebar.header("🔑 API 설정")
@@ -407,7 +452,7 @@ def fetch_text_from_url(url: str, max_chars: int = 650, timeout: int = 10, retri
         return ""
 
 def fetch_one_book_nl(c: dict) -> dict:
-    # UI를 깔끔하게 유지하기 위해 실패 note는 저장만 하고(혹은 빈값) 화면에선 미출력
+    # 실패/없음 안내문구는 UI에 띄우지 않도록 값은 그냥 빈칸으로 둠
     if not nl_api_key:
         return {**c, "isbn": "", "cover_url": "", "summary": "", "note": ""}
 
@@ -446,7 +491,7 @@ def fetch_one_book_nl(c: dict) -> dict:
         }
 
     except (ReadTimeout, ConnectionError, HTTPError, RequestException):
-        # demo_mode라도 UI 경고를 띄우지 않기 위해 note는 비움
+        # demo_mode 여부와 관계없이 UI가 깔끔하게 보이도록 빈 값 반환
         return {**c, "isbn": "", "cover_url": "", "summary": "", "note": ""}
 
 # =====================================================
@@ -500,7 +545,11 @@ if clicked:
             used_ai = False
             if openai_api_key:
                 try:
-                    ai_recs = ai_pick_books_korean_only(answers, focus_genres=focus_genres, top_situations=top_situations)
+                    ai_recs = ai_pick_books_korean_only(
+                        answers,
+                        focus_genres=focus_genres,
+                        top_situations=top_situations
+                    )
                     if len(ai_recs) == 3:
                         candidates = ai_recs
                         used_ai = True
@@ -555,50 +604,92 @@ if clicked:
             }
 
 # =====================================================
-# Render (깔끔 버전: 없으면 그냥 안 그린다)
+# Render (예쁜 카드 UI 버전)
 # =====================================================
 if st.session_state.submitted and st.session_state.result:
     r = st.session_state.result
 
     st.subheader("📌 분석 결과")
-    st.success(f"독서 성향: {', '.join(r['genre_top'])}")
-    sit_text = ", ".join([tag_display.get(t, t) for t in r["situation_top"]])
-    st.info(f"현재 필요한 것: **{sit_text}**")
 
-    # 상태 안내 문구는 최소만 (원하면 이것도 제거 가능)
-    if r.get("used_ai"):
-        st.caption("✅ OpenAI 기반 추천")
-    else:
-        st.caption("ℹ️ 데모 추천 목록 기반")
+    sit_text = ", ".join([tag_display.get(t, t) for t in r["situation_top"]])
+    genre_text = ", ".join(r["genre_top"])
+
+    # 상단 요약 카드
+    st.markdown(
+        f"""
+        <div class="result-card">
+          <div class="title-row">
+            <div class="pill">📚 성향</div>
+            <div style="font-size:1.05rem; font-weight:800;">{genre_text}</div>
+          </div>
+          <div style="margin-top:10px;" class="title-row">
+            <div class="pill">🎯 지금 필요한 것</div>
+            <div style="font-size:1.02rem; font-weight:750;">{sit_text}</div>
+          </div>
+          <div class="divider-soft"></div>
+          <div class="small-muted">
+            {("✅ OpenAI 기반 추천" if r.get("used_ai") else "ℹ️ 데모 추천 목록 기반")}
+            {(" · 서지정보(표지/ISBN) 연동" if r.get("used_nl") else "")}
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
 
     st.subheader("📚 추천 도서 3권")
 
     for idx, b in enumerate(r["books"], start=1):
-        st.markdown(f"### {idx}. {b['title']}")
+        title = b.get("title", "").strip()
+        author = b.get("author", "").strip()
+        isbn = b.get("isbn", "").strip()
+        cover = b.get("cover_url", "").strip()
+        why = b.get("why", "").strip()
+        summary = b.get("summary", "").strip()
+        genre = b.get("genre", "").strip()
 
-        meta = []
-        if b.get("author"):
-            meta.append(f"저자: {b['author']}")
-        if b.get("isbn"):
-            meta.append(f"ISBN: {b['isbn']}")
-        if meta:
-            st.caption(" · ".join(meta))
+        # 각 책 카드
+        st.markdown('<div class="result-card">', unsafe_allow_html=True)
 
-        cols = st.columns([1, 2])
+        # 상단 타이틀 + 태그
+        st.markdown(
+            f"""
+            <div class="title-row">
+              <span class="pill">#{idx}</span>
+              {f'<span class="pill">🏷️ {genre}</span>' if genre else ''}
+            </div>
+            <div class="book-title">{title}</div>
+            <div class="book-meta">
+              {("저자: " + author) if author else ""}
+              {(" · " if author and isbn else "")}
+              {("ISBN: " + isbn) if isbn else ""}
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
 
-        # 표지: URL 있을 때만 이미지 표시 (없으면 아무것도 안 보여줌)
-        with cols[0]:
-            if b.get("cover_url"):
-                st.image(b["cover_url"], use_container_width=True)
+        col1, col2 = st.columns([1.05, 1.95], gap="large")
 
-        with cols[1]:
-            st.write("**추천 이유**")
-            if b.get("why"):
-                st.write(f"- {b['why']}")
+        # 표지: 있을 때만
+        with col1:
+            if cover:
+                st.image(cover, use_container_width=True)
 
-            # 줄거리: 내용 있을 때만 섹션 표시 (없으면 아무것도 안 보여줌)
-            if b.get("summary"):
-                st.write("**줄거리/책소개**")
-                st.write(b["summary"])
+        # 내용
+        with col2:
+            if why:
+                st.markdown(
+                    f"""
+                    <div class="why-box">
+                      <div class="why-label">✨ 추천 이유</div>
+                      <div>{why}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
 
-        st.divider()
+            # 줄거리: 있을 때만 expander
+            if summary:
+                with st.expander("📖 줄거리/책소개 보기"):
+                    st.write(summary)
+
+        st.markdown("</div>", unsafe_allow_html=True)
